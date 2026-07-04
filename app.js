@@ -27,6 +27,7 @@
     sidebarCollapsed: false,
     currentRoute: 'dashboard',
     map: null,
+    heatMap: null,
     mapLayers: {},           // key -> L.LayerGroup
     autosaveTimer: null,
     realtimeChannels: [],
@@ -60,6 +61,15 @@
   }
   function debounce(fn, wait) {
     let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), wait); };
+  }
+  // Jarak antar 2 titik lat/lng dalam meter (formula Haversine).
+  function haversineMeters(lat1, lng1, lat2, lng2) {
+    const R = 6371000;
+    const toRad = (d) => (d * Math.PI) / 180;
+    const dLat = toRad(lat2 - lat1);
+    const dLng = toRad(lng2 - lng1);
+    const a = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+    return R * 2 * Math.asin(Math.sqrt(a));
   }
 
   /* ================= [SUPABASE] CLIENT & AUTH ================= */
@@ -338,10 +348,13 @@
         result[statKey] = error ? 0 : (count || 0);
       } catch (e) { result[statKey] = 0; }
     }));
-    if (result.totalRumah && result.totalOdp) {
-      // estimasi kasar coverage: rumah tercakup ODP vs total rumah (placeholder,
-      // akan disempurnakan saat modul Coverage (Fase 3) tersedia).
-      result.coveragePercent = Math.min(100, Math.round((result.totalOdp * CFG.SPLITTER.ODP_RATIO / result.totalRumah) * 100));
+    if (result.totalRumah) {
+      try {
+        const cov = await computeCoverage();
+        result.coveragePercent = cov.percent;
+      } catch (e) {
+        // Tabel odp/homes belum tersedia atau error lain — biarkan 0, tidak mengganggu tampilan.
+      }
     }
     return result;
   }
@@ -438,6 +451,58 @@
       },
       () => toast('Gagal mendapatkan lokasi. Periksa izin lokasi browser.', 'error')
     );
+  }
+
+  // ---- Gambar Polygon/Garis di peta (leaflet.draw) --------------------
+  // Dipakai oleh: (a) toolbar halaman Mapping (gambar bebas + toast info),
+  // (b) form Area/Backbone/Distribution/Kabel (gambar lalu simpan ke DB).
+  // shapeType: 'polygon' | 'polyline'
+  // onComplete(geojsonGeometry, layer) dipanggil sekali setelah user selesai
+  // menggambar (double-click / klik titik awal lagi, sesuai leaflet.draw).
+  function drawGeometryOnMap(shapeType, onComplete) {
+    toast('Gambar di peta, lalu klik titik awal lagi (atau double-click) untuk menyelesaikan.', 'info', 4500);
+    location.hash = '#/mapping';
+    const tryStart = () => {
+      if (!App.map) { setTimeout(tryStart, 200); return; }
+      const Handler = shapeType === 'polygon' ? L.Draw.Polygon : L.Draw.Polyline;
+      const drawer = new Handler(App.map, shapeType === 'polygon'
+        ? { shapeOptions: { color: '#1F3A5F', weight: 2 } }
+        : { shapeOptions: { color: '#0B6E99', weight: 3 } });
+      drawer.enable();
+      const onCreated = (e) => {
+        App.map.off(L.Draw.Event.CREATED, onCreated);
+        const layer = e.layer;
+        layer.addTo(App.map);
+        const geojson = layer.toGeoJSON();
+        onComplete(geojson.geometry, layer);
+      };
+      App.map.on(L.Draw.Event.CREATED, onCreated);
+    };
+    setTimeout(tryStart, 250);
+  }
+
+  function showDrawnGeometryToast(geometry, label) {
+    const n = geometry && geometry.coordinates
+      ? (geometry.type === 'Polygon' ? geometry.coordinates[0].length : geometry.coordinates.length)
+      : 0;
+    toast(label + ' berhasil digambar (' + n + ' titik).', 'success');
+  }
+
+  // Konversi geometry GeoJSON (Polygon/LineString) -> EWKT untuk kolom PostGIS.
+  // PostGIS mendaftarkan cast text->geometry lewat ST_GeomFromText, sehingga
+  // string EWKT ini bisa langsung di-insert/update lewat Supabase (PostgREST)
+  // tanpa perlu RPC tambahan.
+  function geometryToWKT(geometry) {
+    if (!geometry || !geometry.coordinates) return null;
+    const ring = (coords) => coords.map((c) => c[0] + ' ' + c[1]).join(', ');
+    if (geometry.type === 'Polygon') {
+      const outer = geometry.coordinates[0];
+      return 'SRID=4326;POLYGON((' + ring(outer) + '))';
+    }
+    if (geometry.type === 'LineString') {
+      return 'SRID=4326;LINESTRING(' + ring(geometry.coordinates) + ')';
+    }
+    return null;
   }
 
   function openImportDialog() {
@@ -716,6 +781,31 @@
         formEl.appendChild(pickBtn);
       }
 
+      // geomState.value menampung geometry GeoJSON hasil gambar (Polygon/LineString)
+      // untuk Area/Backbone/Distribution/Kabel. Jika edit dan tidak digambar ulang,
+      // geometry lama di database tetap dipakai (tidak dikirim ulang ke payload).
+      const geomState = { value: null };
+      if (def.geometryType === 'polygon' || def.geometryType === 'line') {
+        const hasExistingGeom = isEdit && existingRow && existingRow[def.geometryColumn];
+        const geomStatus = el('span', { class: 'text-xs text-muted', style: 'margin-left:10px;' }, [
+          hasExistingGeom ? 'Geometri sudah ada. Gambar ulang untuk mengganti.' : 'Belum digambar.',
+        ]);
+        const drawBtn = el('button', { type: 'button', class: 'btn btn-secondary btn-sm', style: 'grid-column:1/-1;width:fit-content;' }, [
+          el('i', { class: def.geometryType === 'polygon' ? 'fa-solid fa-draw-polygon' : 'fa-solid fa-slash' }),
+          def.geometryType === 'polygon' ? ' Gambar Area di Peta' : ' Gambar Jalur Kabel di Peta',
+        ]);
+        drawBtn.addEventListener('click', () => {
+          drawGeometryOnMap(def.geometryType === 'polygon' ? 'polygon' : 'polyline', (geometry) => {
+            geomState.value = geometry;
+            const n = geometry.type === 'Polygon' ? geometry.coordinates[0].length : geometry.coordinates.length;
+            geomStatus.textContent = 'Digambar baru: ' + n + ' titik. Kembali membuka form untuk simpan.';
+            toast(def.title + ': geometri siap disimpan.', 'success');
+          });
+        });
+        const geomWrap = el('div', { class: 'form-field full', style: 'display:flex;align-items:center;flex-wrap:wrap;gap:0;' }, [drawBtn, geomStatus]);
+        formEl.appendChild(geomWrap);
+      }
+
       const wrapper = el('div');
       let overlayRef;
       const header = el('div', { class: 'modal-header' }, [
@@ -725,18 +815,28 @@
       const body = el('div', { class: 'modal-body' }, [formEl]);
       const footer = el('div', { class: 'modal-footer' }, [
         el('button', { type: 'button', class: 'btn btn-ghost', onclick: () => closeModal(overlayRef) }, ['Batal']),
-        el('button', { type: 'button', class: 'btn btn-primary', onclick: () => submitAssetForm(inputRefs, existingRow, () => closeModal(overlayRef)) }, [isEdit ? 'Simpan Perubahan' : 'Simpan']),
+        el('button', { type: 'button', class: 'btn btn-primary', onclick: () => submitAssetForm(inputRefs, existingRow, geomState, () => closeModal(overlayRef)) }, [isEdit ? 'Simpan Perubahan' : 'Simpan']),
       ]);
       wrapper.appendChild(header); wrapper.appendChild(body); wrapper.appendChild(footer);
       overlayRef = openModal(wrapper, { size: 'md' });
     }
 
-    async function submitAssetForm(inputRefs, existingRow, onDone) {
+    async function submitAssetForm(inputRefs, existingRow, geomState, onDone) {
       const payload = {};
       for (const f of def.fields) {
         const raw = inputRefs[f.key].value;
         if (f.required && !raw) { toast(f.label + ' wajib diisi.', 'warning'); return; }
         payload[f.key] = f.type === 'number' ? (raw === '' ? null : Number(raw)) : (raw || null);
+      }
+      if ((def.geometryType === 'polygon' || def.geometryType === 'line')) {
+        if (geomState && geomState.value) {
+          payload[def.geometryWriteColumn] = geometryToWKT(geomState.value);
+        } else if (!existingRow) {
+          toast('Silakan gambar ' + (def.geometryType === 'polygon' ? 'area' : 'jalur') + ' di peta terlebih dahulu.', 'warning');
+          return;
+        }
+        // Jika edit tanpa gambar ulang: kolom geometry tidak disertakan di payload,
+        // sehingga geometry lama di database tidak berubah.
       }
       try {
         let error;
@@ -764,17 +864,34 @@
     }
 
     function showOnMap(row) {
-      if (def.geometryType !== 'point' || row.lat == null || row.lng == null) {
-        toast('Data ini tidak memiliki koordinat titik.', 'info');
+      if (def.geometryType === 'point') {
+        if (row.lat == null || row.lng == null) { toast('Data ini tidak memiliki koordinat titik.', 'info'); return; }
+        location.hash = '#/mapping';
+        setTimeout(() => {
+          if (App.map) {
+            App.map.setView([row.lat, row.lng], 17);
+            L.marker([row.lat, row.lng]).addTo(App.map).bindPopup(row.name || row.owner_name || def.title).openPopup();
+          }
+        }, 300);
         return;
       }
-      location.hash = '#/mapping';
-      setTimeout(() => {
-        if (App.map) {
-          App.map.setView([row.lat, row.lng], 17);
-          L.marker([row.lat, row.lng]).addTo(App.map).bindPopup(row.name || row.owner_name || def.title).openPopup();
-        }
-      }, 300);
+      if (def.geometryType === 'polygon' || def.geometryType === 'line') {
+        const raw = row[def.geometryColumn];
+        if (!raw) { toast('Data ini belum punya geometri. Edit data untuk menggambarnya di peta.', 'info'); return; }
+        let geojson;
+        try { geojson = typeof raw === 'string' ? JSON.parse(raw) : raw; }
+        catch (e) { toast('Geometri data tidak valid.', 'error'); return; }
+        location.hash = '#/mapping';
+        setTimeout(() => {
+          if (App.map) {
+            const layer = L.geoJSON(geojson, { style: { color: '#1F3A5F', weight: 3 } }).addTo(App.map);
+            layer.bindPopup(row.name || def.title);
+            try { App.map.fitBounds(layer.getBounds(), { maxZoom: 17 }); } catch (e) {}
+          }
+        }, 300);
+        return;
+      }
+      toast('Data ini tidak memiliki geometri untuk ditampilkan.', 'info');
     }
   }
 
@@ -798,19 +915,708 @@
   // Registrasi seluruh modul aset dari config.js
   Object.entries(CFG.ASSET_DEFS).forEach(([key, def]) => createAssetModule(key, def));
 
+  /* ================= [COVERAGE] ANALISIS COVERAGE ODP (FASE 3) ================= */
+  // Menghitung berapa rumah yang berada dalam radius layanan ODP terdekat
+  // (CFG.COVERAGE.ODP_SERVICE_RADIUS_M) vs total rumah. Perhitungan dilakukan
+  // di sisi client (vanilla JS, Haversine) — cukup untuk skala menengah;
+  // untuk dataset sangat besar sebaiknya dipindah ke RPC/PostGIS di Fase lanjut.
+  async function computeCoverage() {
+    const radius = CFG.COVERAGE.ODP_SERVICE_RADIUS_M;
+    const limit = CFG.PERFORMANCE.MAP_PAGE_SIZE;
+    const [{ data: odpRows, error: odpErr }, { data: homeRows, error: homeErr }] = await Promise.all([
+      App.supabase.from('odp').select('id, name, lat, lng').limit(limit),
+      App.supabase.from('homes').select('id, owner_name, address, lat, lng, odp_id').limit(limit),
+    ]);
+    if (odpErr || homeErr) throw new Error((odpErr || homeErr).message);
+
+    const odpList = odpRows || [];
+    const homes = (homeRows || []).map((h) => {
+      let nearest = null, nearestDist = Infinity;
+      odpList.forEach((o) => {
+        if (o.lat == null || o.lng == null || h.lat == null || h.lng == null) return;
+        const d = haversineMeters(h.lat, h.lng, o.lat, o.lng);
+        if (d < nearestDist) { nearestDist = d; nearest = o; }
+      });
+      const covered = nearest !== null && nearestDist <= radius;
+      return { ...h, nearestOdp: nearest, distanceM: nearest ? Math.round(nearestDist) : null, covered };
+    });
+    const total = homes.length;
+    const covered = homes.filter((h) => h.covered).length;
+    const percent = total ? Math.round((covered / total) * 100) : 0;
+    return { radius, odpList, homes, total, covered, uncovered: total - covered, percent };
+  }
+  App.computeCoverage = computeCoverage; // ekspos agar bisa dipakai modul lain (mis. Dashboard, Validation)
+
+  registerModule('coverage', async function renderCoverage(container) {
+    container.innerHTML = '<div class="skeleton" style="height:160px;border-radius:10px;"></div>';
+    $('#page-toolbar').innerHTML = '';
+    $('#page-toolbar').appendChild(el('div', { class: 'table-toolbar' }, [
+      el('button', { class: 'btn btn-secondary btn-sm', onclick: () => renderCoverage(container) }, [
+        el('i', { class: 'fa-solid fa-rotate' }), ' Hitung Ulang',
+      ]),
+      el('button', { class: 'btn btn-primary btn-sm', onclick: () => showCoverageOnMap() }, [
+        el('i', { class: 'fa-solid fa-map' }), ' Tampilkan di Peta',
+      ]),
+    ]));
+
+    let result;
+    try {
+      result = await computeCoverage();
+    } catch (err) {
+      container.innerHTML = '';
+      container.appendChild(el('div', { class: 'empty-state' }, [
+        el('i', { class: 'fa-solid fa-triangle-exclamation' }),
+        el('div', {}, ['Gagal memuat data coverage: ' + err.message]),
+        el('div', { class: 'text-xs text-muted' }, ['Pastikan tabel "odp" dan "homes" sudah ada (lihat 002_assets.sql).']),
+      ]));
+      return;
+    }
+    App.lastCoverageResult = result; // dipakai showCoverageOnMap()
+
+    container.innerHTML = '';
+    const grid = el('div', { class: 'stat-grid' }, [
+      statCard('fa-house', fmtNumber(result.total), 'Total Rumah'),
+      statCard('fa-wifi', fmtNumber(result.covered), 'Rumah Tercakup ODP'),
+      statCard('fa-triangle-exclamation', fmtNumber(result.uncovered), 'Belum Tercakup'),
+      statCard('fa-chart-pie', result.percent + '%', 'Persentase Coverage'),
+    ]);
+    container.appendChild(grid);
+
+    const infoCard = el('div', { class: 'card' }, [
+      el('div', { class: 'card-header' }, [el('h3', {}, ['Ketentuan'])]),
+      el('p', { class: 'text-muted text-sm' }, [
+        `Rumah dianggap "tercakup" bila jarak ke ODP terdekat ≤ ${fmtNumber(result.radius)} meter ` +
+        `(CFG.COVERAGE.ODP_SERVICE_RADIUS_M di config.js). Total ODP terdata: ${fmtNumber(result.odpList.length)}.`,
+      ]),
+    ]);
+    container.appendChild(infoCard);
+
+    const listCard = el('div', { class: 'card' }, [
+      el('div', { class: 'card-header' }, [el('h3', {}, ['Rumah Belum Tercakup']), el('span', { class: 'text-xs text-muted' }, [fmtNumber(result.uncovered) + ' rumah'])]),
+    ]);
+    const uncoveredRows = result.homes.filter((h) => !h.covered).slice(0, 100);
+    if (!uncoveredRows.length) {
+      listCard.appendChild(el('div', { class: 'empty-state' }, [
+        el('i', { class: 'fa-solid fa-circle-check' }),
+        el('div', {}, ['Semua rumah sudah tercakup ODP dalam radius layanan. 🎉']),
+      ]));
+    } else {
+      const table = el('table', { class: 'data-table' });
+      table.appendChild(el('thead', {}, [el('tr', {}, ['Nama Pemilik', 'Alamat', 'ODP Terdekat', 'Jarak (m)', 'Aksi'].map((h) => el('th', {}, [h])))]));
+      const tbody = el('tbody');
+      uncoveredRows.forEach((h) => {
+        tbody.appendChild(el('tr', {}, [
+          el('td', {}, [h.owner_name || '-']),
+          el('td', {}, [h.address || '-']),
+          el('td', {}, [h.nearestOdp ? h.nearestOdp.name : '- (belum ada ODP)']),
+          el('td', {}, [h.distanceM != null ? fmtNumber(h.distanceM) : '-']),
+          el('td', {}, [
+            el('button', { class: 'icon-btn btn-icon-only', title: 'Lihat di Peta', onclick: () => {
+              location.hash = '#/mapping';
+              setTimeout(() => {
+                if (App.map && h.lat != null && h.lng != null) {
+                  App.map.setView([h.lat, h.lng], 17);
+                  L.marker([h.lat, h.lng]).addTo(App.map).bindPopup(h.owner_name || 'Rumah').openPopup();
+                }
+              }, 300);
+            } }, [el('i', { class: 'fa-solid fa-location-dot', style: 'font-size:12px' })]),
+          ]),
+        ]));
+      });
+      table.appendChild(tbody);
+      listCard.appendChild(table);
+      if (result.uncovered > 100) {
+        listCard.appendChild(el('p', { class: 'text-xs text-muted', style: 'margin-top:8px;' }, [
+          'Menampilkan 100 dari ' + fmtNumber(result.uncovered) + ' rumah belum tercakup.',
+        ]));
+      }
+    }
+    container.appendChild(listCard);
+  });
+
+  function statCard(icon, value, label) {
+    return el('div', { class: 'stat-card' }, [
+      el('div', { class: 'stat-icon' }, [el('i', { class: `fa-solid ${icon}` })]),
+      el('div', {}, [el('div', { class: 'stat-value' }, [value]), el('div', { class: 'stat-label' }, [label])]),
+    ]);
+  }
+
+  function showCoverageOnMap() {
+    const result = App.lastCoverageResult;
+    if (!result) { toast('Hitung coverage terlebih dahulu.', 'info'); return; }
+    location.hash = '#/mapping';
+    setTimeout(() => {
+      if (!App.map) return;
+      result.odpList.forEach((o) => {
+        if (o.lat == null || o.lng == null) return;
+        L.circle([o.lat, o.lng], { radius: result.radius, color: '#0B6E99', weight: 1, fillOpacity: 0.08 }).addTo(App.map);
+        L.circleMarker([o.lat, o.lng], { radius: 5, color: '#0B6E99', fillColor: '#0B6E99', fillOpacity: 1 }).addTo(App.map).bindPopup('ODP: ' + o.name);
+      });
+      result.homes.forEach((h) => {
+        if (h.lat == null || h.lng == null) return;
+        const color = h.covered ? '#1E7B4D' : '#B3261E';
+        L.circleMarker([h.lat, h.lng], { radius: 5, color, fillColor: color, fillOpacity: 0.9 })
+          .addTo(App.map)
+          .bindPopup((h.owner_name || 'Rumah') + (h.covered ? ' — tercakup' : ' — belum tercakup'));
+      });
+      toast('Peta coverage ditampilkan: hijau = tercakup, merah = belum tercakup.', 'info', 4000);
+    }, 300);
+  }
+
+  /* ================= [VALIDATION] VALIDASI TOPOLOGI & SPLITTER (FASE 3) ================= */
+  // Aturan yang divalidasi (semua dibaca dari config.js, bukan hardcode, supaya
+  // menambah modul aset baru di config.js otomatis ikut divalidasi):
+  //   1. Field bertipe 'relation' yang masih kosong (mis. Rumah belum punya ODP).
+  //   2. Splitter melebihi kapasitas (ODC 1:4, ODP 1:8, dari def.splitter).
+  //   3. Geometri (polygon/line) yang belum digambar di peta.
+  //   4. Rumah yang terhubung ke ODP tapi jaraknya melebihi radius layanan.
+  async function runValidation() {
+    const issues = [];
+
+    // 1) Relasi kosong
+    for (const [assetKey, def] of Object.entries(CFG.ASSET_DEFS)) {
+      const nameKey = def.fields.find((f) => f.type === 'text')?.key || 'name';
+      for (const f of def.fields) {
+        if (f.type !== 'relation') continue;
+        try {
+          const { data, error } = await App.supabase.from(def.table).select('id, ' + nameKey + ', ' + f.key).is(f.key, null).limit(200);
+          if (!error && data && data.length) {
+            issues.push({
+              severity: 'warning', category: 'Relasi Belum Terhubung',
+              title: def.title + ': "' + f.label + '" belum diisi',
+              count: data.length, assetKey, nameKey, items: data,
+            });
+          }
+        } catch (e) { /* tabel belum ada — lewati, bukan error fatal */ }
+      }
+    }
+
+    // 2) Splitter melebihi kapasitas
+    for (const [assetKey, def] of Object.entries(CFG.ASSET_DEFS)) {
+      if (!def.splitter) continue;
+      try {
+        const ratio = CFG.SPLITTER[def.splitter.ratioKey];
+        const { data: parents } = await App.supabase.from(def.table).select('id, name');
+        const { data: children } = await App.supabase.from(def.splitter.childTable).select(def.splitter.parentKey);
+        const counts = {};
+        (children || []).forEach((c) => { const pid = c[def.splitter.parentKey]; counts[pid] = (counts[pid] || 0) + 1; });
+        const over = (parents || [])
+          .filter((p) => (counts[p.id] || 0) > ratio)
+          .map((p) => ({ id: p.id, name: p.name + ' (' + (counts[p.id] || 0) + '/' + ratio + ')' }));
+        if (over.length) {
+          issues.push({
+            severity: 'error', category: 'Splitter Melebihi Kapasitas',
+            title: def.title + ': melebihi rasio 1:' + ratio + ' ke ' + def.splitter.childLabel,
+            count: over.length, assetKey, nameKey: 'name', items: over,
+          });
+        }
+      } catch (e) { /* tabel belum ada — lewati */ }
+    }
+
+    // 3) Geometri belum digambar
+    for (const [assetKey, def] of Object.entries(CFG.ASSET_DEFS)) {
+      if (def.geometryType !== 'polygon' && def.geometryType !== 'line') continue;
+      try {
+        const { data, error } = await App.supabase.from(def.table).select('id, name, ' + def.geometryColumn).is(def.geometryColumn, null).limit(200);
+        if (!error && data && data.length) {
+          issues.push({
+            severity: 'info', category: 'Geometri Belum Digambar',
+            title: def.title + ': belum punya geometri di peta',
+            count: data.length, assetKey, nameKey: 'name', items: data,
+          });
+        }
+      } catch (e) { /* tabel/kolom belum ada — lewati */ }
+    }
+
+    // 4) Rumah terhubung ODP tapi di luar radius layanan
+    try {
+      const radius = CFG.COVERAGE.ODP_SERVICE_RADIUS_M;
+      const { data: homes } = await App.supabase.from('homes').select('id, owner_name, lat, lng, odp_id').not('odp_id', 'is', null).limit(CFG.PERFORMANCE.MAP_PAGE_SIZE);
+      const { data: odpRows } = await App.supabase.from('odp').select('id, name, lat, lng');
+      const odpMap = {}; (odpRows || []).forEach((o) => { odpMap[o.id] = o; });
+      const mismatched = (homes || [])
+        .filter((h) => {
+          const o = odpMap[h.odp_id];
+          if (!o || o.lat == null || o.lng == null || h.lat == null || h.lng == null) return false;
+          return haversineMeters(h.lat, h.lng, o.lat, o.lng) > radius;
+        })
+        .map((h) => ({ id: h.id, name: (h.owner_name || 'Rumah') + ' → ' + (odpMap[h.odp_id]?.name || '?') }));
+      if (mismatched.length) {
+        issues.push({
+          severity: 'warning', category: 'Penempatan ODP Tidak Sesuai',
+          title: 'Rumah terhubung ODP di luar radius layanan (' + fmtNumber(radius) + ' m)',
+          count: mismatched.length, assetKey: 'rumah', nameKey: 'name', items: mismatched,
+        });
+      }
+    } catch (e) { /* tabel belum ada — lewati */ }
+
+    return issues;
+  }
+  App.runValidation = runValidation;
+
+  const SEVERITY_META = {
+    error: { label: 'Error', color: 'badge-danger', icon: 'fa-circle-xmark' },
+    warning: { label: 'Warning', color: 'badge-warning', icon: 'fa-triangle-exclamation' },
+    info: { label: 'Info', color: 'badge-info', icon: 'fa-circle-info' },
+  };
+
+  registerModule('validation', async function renderValidation(container) {
+    container.innerHTML = '<div class="skeleton" style="height:160px;border-radius:10px;"></div>';
+    $('#page-toolbar').innerHTML = '';
+    $('#page-toolbar').appendChild(el('div', { class: 'table-toolbar' }, [
+      el('button', { class: 'btn btn-secondary btn-sm', onclick: () => renderValidation(container) }, [
+        el('i', { class: 'fa-solid fa-rotate' }), ' Jalankan Ulang Validasi',
+      ]),
+    ]));
+
+    let issues;
+    try {
+      issues = await runValidation();
+    } catch (err) {
+      container.innerHTML = '';
+      container.appendChild(el('div', { class: 'empty-state' }, [
+        el('i', { class: 'fa-solid fa-triangle-exclamation' }),
+        el('div', {}, ['Gagal menjalankan validasi: ' + err.message]),
+      ]));
+      return;
+    }
+
+    container.innerHTML = '';
+    const counts = { error: 0, warning: 0, info: 0 };
+    issues.forEach((i) => { counts[i.severity] += i.count; });
+    const grid = el('div', { class: 'stat-grid' }, [
+      statCard('fa-circle-xmark', fmtNumber(counts.error), 'Error (wajib diperbaiki)'),
+      statCard('fa-triangle-exclamation', fmtNumber(counts.warning), 'Warning'),
+      statCard('fa-circle-info', fmtNumber(counts.info), 'Info'),
+      statCard('fa-list-check', fmtNumber(issues.length), 'Kategori Ditemukan'),
+    ]);
+    container.appendChild(grid);
+
+    if (!issues.length) {
+      container.appendChild(el('div', { class: 'card empty-state' }, [
+        el('i', { class: 'fa-solid fa-circle-check' }),
+        el('h3', {}, ['Tidak ada masalah ditemukan']),
+        el('p', { class: 'text-muted' }, ['Semua relasi, splitter, dan geometri sudah sesuai aturan.']),
+      ]));
+      return;
+    }
+
+    // Urutkan: error dulu, lalu warning, lalu info
+    const order = { error: 0, warning: 1, info: 2 };
+    issues.sort((a, b) => order[a.severity] - order[b.severity]);
+
+    issues.forEach((issue) => {
+      const meta = SEVERITY_META[issue.severity];
+      const card = el('div', { class: 'card' }, [
+        el('div', { class: 'card-header' }, [
+          el('h3', {}, [
+            el('i', { class: `fa-solid ${meta.icon}`, style: 'margin-right:8px;' }),
+            issue.title,
+          ]),
+          el('span', { class: `badge ${meta.color}` }, [meta.label + ' · ' + fmtNumber(issue.count)]),
+        ]),
+      ]);
+      const list = el('div', { class: 'validation-item-list' });
+      issue.items.slice(0, 20).forEach((row) => {
+        list.appendChild(el('div', { class: 'layer-item' }, [
+          el('span', {}, [String(row[issue.nameKey] ?? row.name ?? row.id)]),
+          el('button', { class: 'btn btn-ghost btn-sm', style: 'margin-left:auto;', onclick: () => { location.hash = '#/' + issue.assetKey; } }, [
+            'Buka ' + (CFG.ASSET_DEFS[issue.assetKey]?.title || issue.assetKey),
+          ]),
+        ]));
+      });
+      card.appendChild(list);
+      if (issue.count > 20) {
+        card.appendChild(el('p', { class: 'text-xs text-muted', style: 'margin-top:8px;' }, [
+          'Menampilkan 20 dari ' + fmtNumber(issue.count) + ' data.',
+        ]));
+      }
+      container.appendChild(card);
+    });
+  });
+
+  /* ================= [HEATMAP] KEPADATAN RUMAH (FASE 3) ================= */
+  // Peta terpisah dari App.map (modul Mapping) supaya tidak saling bertabrakan
+  // saat pindah halaman. Memakai plugin leaflet.heat yang sudah dimuat di
+  // index.html (L.heatLayer).
+  registerModule('heatmap', async function renderHeatmap(container) {
+    container.innerHTML = '';
+    $('#page-toolbar').innerHTML = '';
+    const statusSelect = el('select', { class: 'text-input', style: 'max-width:200px;' }, [
+      el('option', { value: '' }, ['Semua Status']),
+      el('option', { value: 'Prospek' }, ['Prospek']),
+      el('option', { value: 'Survey' }, ['Survey']),
+      el('option', { value: 'Pelanggan' }, ['Pelanggan']),
+    ]);
+    statusSelect.addEventListener('change', () => loadHeat());
+    $('#page-toolbar').appendChild(el('div', { class: 'table-toolbar' }, [
+      el('span', { class: 'text-sm text-muted' }, ['Filter Status:']),
+      statusSelect,
+      el('button', { class: 'btn btn-secondary btn-sm', onclick: () => loadHeat() }, [
+        el('i', { class: 'fa-solid fa-rotate' }), ' Refresh',
+      ]),
+    ]));
+
+    const mapWrap = el('div', { id: 'heatmap-container', style: 'height:calc(100vh - 230px);border-radius:12px;overflow:hidden;' });
+    const countLabel = el('p', { class: 'text-xs text-muted', style: 'margin-top:10px;' }, ['Memuat...']);
+    const legend = el('div', { class: 'card', style: 'margin-top:12px;' }, [
+      el('div', { class: 'card-header' }, [el('h3', {}, ['Legenda'])]),
+      el('p', { class: 'text-muted text-sm' }, ['Warna biru → hijau → kuning → merah menunjukkan kepadatan rumah yang meningkat pada titik tersebut.']),
+      countLabel,
+    ]);
+    container.appendChild(mapWrap);
+    container.appendChild(legend);
+
+    App.heatMap = L.map(mapWrap, { zoomControl: true }).setView(CFG.DEFAULT_CENTER, CFG.DEFAULT_ZOOM);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap contributors', maxZoom: 20,
+    }).addTo(App.heatMap);
+    let heatLayer = null;
+
+    async function loadHeat() {
+      countLabel.textContent = 'Memuat...';
+      let query = App.supabase.from('homes').select('lat, lng, status').limit(CFG.PERFORMANCE.MAP_PAGE_SIZE);
+      if (statusSelect.value) query = query.eq('status', statusSelect.value);
+      const { data, error } = await query;
+      if (heatLayer) { App.heatMap.removeLayer(heatLayer); heatLayer = null; }
+      if (error) {
+        countLabel.textContent = 'Gagal memuat data: ' + error.message;
+        return;
+      }
+      const points = (data || []).filter((r) => r.lat != null && r.lng != null).map((r) => [r.lat, r.lng, 0.6]);
+      if (points.length) {
+        heatLayer = L.heatLayer(points, { radius: 28, blur: 22, maxZoom: 17 }).addTo(App.heatMap);
+        try { App.heatMap.fitBounds(L.latLngBounds(points.map((p) => [p[0], p[1]])), { maxZoom: 16 }); } catch (e) {}
+      }
+      countLabel.textContent = fmtNumber(points.length) + ' rumah ditampilkan' + (statusSelect.value ? ' (status: ' + statusSelect.value + ')' : '') + '.';
+    }
+    await loadHeat();
+  }, function destroyHeatmap() {
+    if (App.heatMap) { App.heatMap.remove(); App.heatMap = null; }
+  });
+
+  /* ================= [PLANNING] BOQ, APPROVAL, SUMMARY (FASE 4) ================= */
+  // Ketiganya memakai tabel scenarios/approvals/boq_snapshots dari migration
+  // 004_planning.sql, dan kolom scenario_id (nullable) yang ditambahkan ke
+  // semua tabel aset — filter longgar: undefined = semua data, null = data
+  // global (belum dikaitkan skenario), string = id skenario tertentu.
+
+  async function computeBOQ(scenarioFilter) {
+    const applyFilter = (q) => {
+      if (scenarioFilter === undefined) return q;
+      if (scenarioFilter === null) return q.is('scenario_id', null);
+      return q.eq('scenario_id', scenarioFilter);
+    };
+    const countTable = async (table) => {
+      try {
+        let q = App.supabase.from(table).select('*', { count: 'exact', head: true });
+        const { count, error } = await applyFilter(q);
+        return error ? 0 : (count || 0);
+      } catch (e) { return 0; }
+    };
+    const sumLength = async (table) => {
+      try {
+        let q = App.supabase.from(table).select('length_m');
+        const { data, error } = await applyFilter(q);
+        if (error || !data) return 0;
+        return data.reduce((s, r) => s + (Number(r.length_m) || 0), 0);
+      } catch (e) { return 0; }
+    };
+    const [totalOdc, totalOdp, totalPop, totalTiang, totalClosure, totalHandhole, totalJointbox, totalRumah] = await Promise.all([
+      countTable('odc'), countTable('odp'), countTable('pops'), countTable('poles'),
+      countTable('closures'), countTable('handholes'), countTable('jointboxes'), countTable('homes'),
+    ]);
+    const [panjangBackbone, panjangDistribution, panjangKabel] = await Promise.all([
+      sumLength('backbones'), sumLength('distributions'), sumLength('kabels'),
+    ]);
+    const items = [
+      { label: 'ODC', unit: 'unit', qty: totalOdc },
+      { label: 'ODP', unit: 'unit', qty: totalOdp },
+      { label: 'POP', unit: 'unit', qty: totalPop },
+      { label: 'Tiang Besi', unit: 'unit', qty: totalTiang },
+      { label: 'Closure', unit: 'unit', qty: totalClosure },
+      { label: 'Handhole', unit: 'unit', qty: totalHandhole },
+      { label: 'Joint Box', unit: 'unit', qty: totalJointbox },
+      { label: 'Rumah Terdata', unit: 'unit', qty: totalRumah },
+      { label: 'Kabel Backbone', unit: 'meter', qty: Math.round(panjangBackbone) },
+      { label: 'Kabel Distribution', unit: 'meter', qty: Math.round(panjangDistribution) },
+      { label: 'Kabel Generik', unit: 'meter', qty: Math.round(panjangKabel) },
+    ];
+    return { items };
+  }
+  App.computeBOQ = computeBOQ;
+
+  async function fetchScenarioOptions() {
+    try {
+      const { data, error } = await App.supabase.from('scenarios').select('id, name, status').order('created_at', { ascending: false });
+      return error ? [] : (data || []);
+    } catch (e) { return []; }
+  }
+
+  /* ---- BOQ ---- */
+  registerModule('boq', async function renderBOQ(container) {
+    container.innerHTML = '<div class="skeleton" style="height:160px;border-radius:10px;"></div>';
+    $('#page-toolbar').innerHTML = '';
+    const scenarios = await fetchScenarioOptions();
+    const filterSelect = el('select', { class: 'text-input', style: 'max-width:260px;' }, [
+      el('option', { value: '__all__' }, ['Semua Data (semua skenario)']),
+      el('option', { value: '__null__' }, ['Data Global (belum dikaitkan skenario)']),
+      ...scenarios.map((s) => el('option', { value: s.id }, [s.name + ' (' + s.status + ')'])),
+    ]);
+    filterSelect.addEventListener('change', () => renderTable());
+    $('#page-toolbar').appendChild(el('div', { class: 'table-toolbar' }, [
+      el('span', { class: 'text-sm text-muted' }, ['Skenario:']),
+      filterSelect,
+      el('button', { class: 'btn btn-primary btn-sm', style: 'margin-left:auto;', onclick: () => saveSnapshot() }, [
+        el('i', { class: 'fa-solid fa-floppy-disk' }), ' Simpan Snapshot',
+      ]),
+    ]));
+
+    const boqCard = el('div', { class: 'card' }, [
+      el('div', { class: 'card-header' }, [el('h3', {}, ['Bill of Quantity (Tanpa Harga)'])]),
+    ]);
+    const tableWrap = el('div', { id: 'boq-table-wrap' });
+    boqCard.appendChild(tableWrap);
+
+    const historyCard = el('div', { class: 'card', style: 'margin-top:16px;' }, [
+      el('div', { class: 'card-header' }, [el('h3', {}, ['Riwayat Snapshot'])]),
+      el('div', { id: 'boq-history-wrap' }, [el('p', { class: 'text-muted' }, ['Memuat...'])]),
+    ]);
+
+    container.innerHTML = '';
+    container.appendChild(boqCard);
+    container.appendChild(historyCard);
+
+    function currentFilter() {
+      const v = filterSelect.value;
+      if (v === '__all__') return undefined;
+      if (v === '__null__') return null;
+      return v;
+    }
+
+    async function renderTable() {
+      tableWrap.innerHTML = '<div class="skeleton" style="height:120px;"></div>';
+      const { items } = await computeBOQ(currentFilter());
+      tableWrap.innerHTML = '';
+      const table = el('table', { class: 'data-table' });
+      table.appendChild(el('thead', {}, [el('tr', {}, ['Item', 'Satuan', 'Jumlah'].map((h) => el('th', {}, [h])))]));
+      const tbody = el('tbody');
+      items.forEach((it) => {
+        tbody.appendChild(el('tr', {}, [
+          el('td', {}, [it.label]),
+          el('td', {}, [it.unit]),
+          el('td', {}, [fmtNumber(it.qty)]),
+        ]));
+      });
+      table.appendChild(tbody);
+      tableWrap.appendChild(table);
+    }
+
+    async function renderHistory() {
+      const wrap = $('#boq-history-wrap');
+      if (!wrap) return;
+      const { data, error } = await App.supabase.from('boq_snapshots').select('id, scenario_id, generated_at, data').order('generated_at', { ascending: false }).limit(10);
+      wrap.innerHTML = '';
+      if (error || !data || !data.length) {
+        wrap.appendChild(el('p', { class: 'text-muted' }, ['Belum ada snapshot tersimpan.']));
+        return;
+      }
+      data.forEach((snap) => {
+        const scn = scenarios.find((s) => s.id === snap.scenario_id);
+        wrap.appendChild(el('div', { class: 'layer-item' }, [
+          el('span', {}, [(scn ? scn.name : 'Data Global') + ' — ' + fmtDate(snap.generated_at)]),
+          el('span', { class: 'text-xs text-muted', style: 'margin-left:auto;' }, [(snap.data.items || []).length + ' item']),
+        ]));
+      });
+    }
+
+    async function saveSnapshot() {
+      const filter = currentFilter();
+      const { items } = await computeBOQ(filter);
+      const uid = App.session && App.session.user ? App.session.user.id : null;
+      const { error } = await App.supabase.from('boq_snapshots').insert({
+        scenario_id: filter === undefined ? null : filter,
+        generated_by: uid,
+        data: { items },
+      });
+      if (error) { toast('Gagal menyimpan snapshot: ' + error.message, 'error'); return; }
+      toast('Snapshot BOQ tersimpan.', 'success');
+      renderHistory();
+    }
+
+    await renderTable();
+    await renderHistory();
+  });
+
+  /* ---- APPROVAL ---- */
+  registerModule('approval', async function renderApproval(container) {
+    container.innerHTML = '<div class="skeleton" style="height:160px;border-radius:10px;"></div>';
+    $('#page-toolbar').innerHTML = '';
+    $('#page-toolbar').appendChild(el('div', { class: 'table-toolbar' }, [
+      el('button', { class: 'btn btn-secondary btn-sm', onclick: () => renderApproval(container) }, [
+        el('i', { class: 'fa-solid fa-rotate' }), ' Refresh',
+      ]),
+    ]));
+
+    const { data: pending, error: pendErr } = await App.supabase
+      .from('scenarios').select('*, projects(name)').eq('status', 'Diajukan').order('updated_at', { ascending: false });
+    const { data: history } = await App.supabase
+      .from('approvals').select('*, scenarios(name)').not('decided_at', 'is', null).order('decided_at', { ascending: false }).limit(20);
+
+    container.innerHTML = '';
+    if (pendErr) {
+      container.appendChild(el('div', { class: 'empty-state' }, [
+        el('i', { class: 'fa-solid fa-triangle-exclamation' }),
+        el('div', {}, ['Gagal memuat data: ' + pendErr.message]),
+        el('div', { class: 'text-xs text-muted' }, ['Pastikan migration 004_planning.sql sudah dijalankan.']),
+      ]));
+      return;
+    }
+
+    const pendingCard = el('div', { class: 'card' }, [
+      el('div', { class: 'card-header' }, [el('h3', {}, ['Menunggu Persetujuan']), el('span', { class: 'badge badge-warning' }, [fmtNumber((pending || []).length)])]),
+    ]);
+    if (!pending || !pending.length) {
+      pendingCard.appendChild(el('div', { class: 'empty-state' }, [
+        el('i', { class: 'fa-solid fa-circle-check' }),
+        el('div', {}, ['Tidak ada skenario yang menunggu persetujuan.']),
+      ]));
+    } else {
+      pending.forEach((scn) => {
+        pendingCard.appendChild(el('div', { class: 'layer-item', style: 'padding:12px 6px;align-items:flex-start;' }, [
+          el('div', { style: 'flex:1;' }, [
+            el('div', { style: 'font-weight:600;' }, [scn.name]),
+            el('div', { class: 'text-xs text-muted' }, ['Project: ' + (scn.projects?.name || '-') + ' · Diajukan: ' + fmtDate(scn.updated_at)]),
+            scn.description ? el('div', { class: 'text-sm', style: 'margin-top:4px;' }, [scn.description]) : null,
+          ].filter(Boolean)),
+          el('button', { class: 'btn btn-primary btn-sm', onclick: () => openApprovalDecisionModal(scn, 'Disetujui', container) }, ['Setujui']),
+          el('button', { class: 'btn btn-danger btn-sm', onclick: () => openApprovalDecisionModal(scn, 'Ditolak', container) }, ['Tolak']),
+        ]));
+      });
+    }
+    container.appendChild(pendingCard);
+
+    const historyCard = el('div', { class: 'card', style: 'margin-top:16px;' }, [
+      el('div', { class: 'card-header' }, [el('h3', {}, ['Riwayat Keputusan'])]),
+    ]);
+    if (!history || !history.length) {
+      historyCard.appendChild(el('p', { class: 'text-muted' }, ['Belum ada riwayat keputusan.']));
+    } else {
+      history.forEach((h) => {
+        const badgeClass = h.status === 'Disetujui' ? 'badge-success' : 'badge-danger';
+        historyCard.appendChild(el('div', { class: 'layer-item' }, [
+          el('span', {}, [(h.scenarios?.name || '-') + (h.notes ? ' — ' + h.notes : '')]),
+          el('span', { class: `badge ${badgeClass}`, style: 'margin-left:auto;' }, [h.status]),
+          el('span', { class: 'text-xs text-muted', style: 'margin-left:8px;' }, [fmtDate(h.decided_at)]),
+        ]));
+      });
+    }
+    container.appendChild(historyCard);
+  });
+
+  function openApprovalDecisionModal(scenario, decision, refreshContainer) {
+    const notesInput = el('textarea', { class: 'text-input', rows: '3', placeholder: 'Catatan (opsional)' });
+    const wrap = el('div');
+    let overlayRef;
+    wrap.appendChild(el('div', { class: 'modal-header' }, [
+      el('h3', {}, [(decision === 'Disetujui' ? 'Setujui' : 'Tolak') + ' Skenario']),
+      el('button', { type: 'button', class: 'icon-btn', onclick: () => closeModal(overlayRef) }, [el('i', { class: 'fa-solid fa-xmark' })]),
+    ]));
+    wrap.appendChild(el('div', { class: 'modal-body' }, [
+      el('p', {}, ['Skenario: ' + scenario.name]),
+      el('div', { class: 'form-field full' }, [el('label', {}, ['Catatan']), notesInput]),
+    ]));
+    wrap.appendChild(el('div', { class: 'modal-footer' }, [
+      el('button', { type: 'button', class: 'btn btn-ghost', onclick: () => closeModal(overlayRef) }, ['Batal']),
+      el('button', {
+        type: 'button', class: `btn ${decision === 'Disetujui' ? 'btn-primary' : 'btn-danger'}`,
+        onclick: () => submitApprovalDecision(scenario, decision, notesInput.value, () => closeModal(overlayRef), refreshContainer),
+      }, [decision === 'Disetujui' ? 'Ya, Setujui' : 'Ya, Tolak']),
+    ]));
+    overlayRef = openModal(wrap, { size: 'sm' });
+  }
+
+  async function submitApprovalDecision(scenario, decision, notes, onDone, refreshContainer) {
+    try {
+      const uid = App.session && App.session.user ? App.session.user.id : null;
+      const { error: updErr } = await App.supabase.from('scenarios').update({ status: decision }).eq('id', scenario.id);
+      if (updErr) throw updErr;
+      const { error: apprErr } = await App.supabase.from('approvals').insert({
+        scenario_id: scenario.id, status: decision, requested_by: scenario.created_by || null,
+        approver_id: uid, notes: notes || null, decided_at: new Date().toISOString(),
+      });
+      if (apprErr) throw apprErr;
+      toast('Skenario "' + scenario.name + '" telah ' + (decision === 'Disetujui' ? 'disetujui.' : 'ditolak.'), 'success');
+      onDone();
+      if (App.currentRoute === 'approval') navigateTo('approval');
+    } catch (err) {
+      toast('Gagal memproses keputusan: ' + err.message, 'error');
+    }
+  }
+
+  /* ---- PLANNING SUMMARY ---- */
+  registerModule('summary', async function renderSummary(container) {
+    container.innerHTML = '<div class="skeleton" style="height:160px;border-radius:10px;"></div>';
+    $('#page-toolbar').innerHTML = '';
+
+    const [coverage, issues, boq, scenarios] = await Promise.all([
+      computeCoverage().catch(() => null),
+      runValidation().catch(() => []),
+      computeBOQ(undefined).catch(() => ({ items: [] })),
+      fetchScenarioOptions(),
+    ]);
+
+    container.innerHTML = '';
+    const errorCount = issues.filter((i) => i.severity === 'error').reduce((s, i) => s + i.count, 0);
+    const warningCount = issues.filter((i) => i.severity === 'warning').reduce((s, i) => s + i.count, 0);
+    const scenarioCounts = { Draft: 0, Diajukan: 0, Disetujui: 0, Ditolak: 0, Diarsipkan: 0 };
+    scenarios.forEach((s) => { if (scenarioCounts[s.status] !== undefined) scenarioCounts[s.status]++; });
+
+    const grid = el('div', { class: 'stat-grid' }, [
+      statCard('fa-wifi', coverage ? coverage.percent + '%' : '-', 'Coverage Rumah'),
+      statCard('fa-circle-xmark', fmtNumber(errorCount), 'Error Validasi'),
+      statCard('fa-triangle-exclamation', fmtNumber(warningCount), 'Warning Validasi'),
+      statCard('fa-stamp', fmtNumber(scenarioCounts.Diajukan), 'Menunggu Approval'),
+    ]);
+    container.appendChild(grid);
+
+    const scnCard = el('div', { class: 'card' }, [
+      el('div', { class: 'card-header' }, [el('h3', {}, ['Status Skenario'])]),
+      el('div', { class: 'stat-grid', style: 'grid-template-columns:repeat(5,1fr);' }, Object.entries(scenarioCounts).map(([status, count]) =>
+        el('div', { class: 'stat-card' }, [el('div', {}, [el('div', { class: 'stat-value' }, [fmtNumber(count)]), el('div', { class: 'stat-label' }, [status])])])
+      )),
+    ]);
+    container.appendChild(scnCard);
+
+    const boqCard = el('div', { class: 'card', style: 'margin-top:16px;' }, [
+      el('div', { class: 'card-header' }, [el('h3', {}, ['Ringkasan BOQ (Semua Data)']), el('button', { class: 'btn btn-ghost btn-sm', onclick: () => { location.hash = '#/boq'; } }, ['Buka BOQ »'])]),
+    ]);
+    const boqTable = el('table', { class: 'data-table' });
+    boqTable.appendChild(el('thead', {}, [el('tr', {}, ['Item', 'Satuan', 'Jumlah'].map((h) => el('th', {}, [h])))]));
+    const boqBody = el('tbody');
+    boq.items.forEach((it) => boqBody.appendChild(el('tr', {}, [el('td', {}, [it.label]), el('td', {}, [it.unit]), el('td', {}, [fmtNumber(it.qty)])])));
+    boqTable.appendChild(boqBody);
+    boqCard.appendChild(boqTable);
+    container.appendChild(boqCard);
+
+    const linksCard = el('div', { class: 'card', style: 'margin-top:16px;' }, [
+      el('div', { class: 'card-header' }, [el('h3', {}, ['Tindak Lanjut'])]),
+      el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;' }, [
+        el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { location.hash = '#/coverage'; } }, ['Buka Coverage']),
+        el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { location.hash = '#/validation'; } }, ['Buka Validation']),
+        el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { location.hash = '#/approval'; } }, ['Buka Approval']),
+        el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { location.hash = '#/scenario'; } }, ['Buka Scenario']),
+      ]),
+    ]);
+    container.appendChild(linksCard);
+  });
+
   /* ================= [MODULES] PLACEHOLDER FASE BERIKUTNYA ================= */
   // Modul di bawah ini akan diisi penuh pada Fase 2-5 sesuai roadmap.
   // Struktur registerModule sudah siap sehingga penambahan tidak mengubah
   // file lain (index.html / style.css tetap sama).
   const PENDING_MODULES = [
     ['import', 'Import Data', 'Gunakan tombol "Import Data" pada halaman Mapping.'],
-    ['coverage', 'Coverage', 'Analisis area yang sudah/belum tercakup. (Fase 3)'],
-    ['validation', 'Validation', 'Validasi topologi & aturan splitter jaringan. (Fase 3)'],
-    ['heatmap', 'Heatmap', 'Kepadatan rumah/prospek pada peta. (Fase 3)'],
-    ['scenario', 'Scenario & Version', 'Skenario perencanaan & version control. (Fase 4)'],
-    ['approval', 'Approval', 'Alur persetujuan rencana jaringan. (Fase 4)'],
-    ['summary', 'Planning Summary', 'Ringkasan hasil perencanaan. (Fase 4)'],
-    ['boq', 'BOQ', 'Bill of Quantity tanpa harga. (Fase 4)'],
     ['export', 'Export', 'Ekspor data ke SHP/PDF/Excel. (Fase 5)'],
     ['notification', 'Notifikasi', 'Notifikasi & log aktivitas sistem. (Fase 5)'],
     ['setting', 'Pengaturan', 'Pengaturan aplikasi & profil pengguna. (Fase 5)'],

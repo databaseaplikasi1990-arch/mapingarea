@@ -9,11 +9,10 @@ window.APP_CONFIG = {
   APP_NAME: 'Mapping Area',
   VERSION: '1.0.0-web',
   COMPANY: 'Mapping Area Enterprise',
-
-  // ---- Supabase ----
-  // Ganti dengan project Supabase Anda sendiri.
-  SUPABASE_URL: 'https://YOUR-PROJECT.supabase.co',
-  SUPABASE_ANON_KEY: 'YOUR-SUPABASE-ANON-KEY',
+   
+// ---- Supabase ----
+SUPABASE_URL: 'https://ykkgqojoarfwbiqtqvlr.supabase.co',
+SUPABASE_ANON_KEY: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inlra2dxb2pvYXJmd2JpcXRxdmxyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODMxNjUxMjMsImV4cCI6MjA5ODc0MTEyM30.0iv3zHxYtqEEBlajAYodOr82fJZRwnPueM0EaO4WEMY',
 
   // ---- Peta ----
   // 'osm'       -> OpenStreetMap raster (Leaflet, tanpa API key)

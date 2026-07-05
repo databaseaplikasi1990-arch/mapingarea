@@ -423,6 +423,9 @@
     initMap(mapWrap);
   }, function destroyMapping() {
     if (App.map) { App.map.remove(); App.map = null; }
+    // CATATAN FIX: jangan hapus App.importedGeoJson (data mentah import).
+    // App.mapLayers hanya menyimpan instance Leaflet layer yang terikat ke
+    // instance map yang baru saja di-destroy, jadi aman di-reset di sini.
     App.mapLayers = {};
   });
 
@@ -441,6 +444,16 @@
     const initialBase = CFG.MAP_PROVIDER === 'satellite' ? baseLayers['Satelit (Esri)'] : baseLayers['Jalan (OSM)'];
     initialBase.addTo(App.map);
     L.control.layers(baseLayers, {}, { position: 'topright' }).addTo(App.map);
+
+    // FIX #2: pulihkan layer hasil import sebelumnya (tersimpan di
+    // App.importedGeoJson, yang TIDAK ikut dihapus saat modul Mapping
+    // di-destroy) supaya tidak hilang ketika pindah menu lalu kembali lagi.
+    if (App.importedGeoJson) {
+      Object.keys(App.importedGeoJson).forEach((key) => {
+        const item = App.importedGeoJson[key];
+        renderGeoJsonLayer(key, item.name, item.geojson);
+      });
+    }
 
     // Toolbar float kiri-atas
     const floatBar = el('div', { class: 'map-toolbar-float' }, [
@@ -597,6 +610,18 @@
 
   function addGeoJsonLayer(name, geojson) {
     if (!App.map) return;
+    // FIX #2: simpan data mentah di penyimpanan yang PERSISTEN lintas
+    // buka-tutup modul Mapping (tidak di-reset di destroyMapping), supaya
+    // saat user pindah menu lalu kembali ke Mapping, layer bisa digambar
+    // ulang dari sini alih-alih hilang begitu saja.
+    if (!App.importedGeoJson) App.importedGeoJson = {};
+    const key = name + '_' + Date.now();
+    App.importedGeoJson[key] = { name, geojson };
+    renderGeoJsonLayer(key, name, geojson);
+  }
+
+  function renderGeoJsonLayer(key, name, geojson) {
+    if (!App.map) return;
     const color = randomLayerColor();
     const layer = L.geoJSON(geojson, {
       style: { color, weight: 2, fillOpacity: 0.15 },
@@ -612,7 +637,7 @@
     const clusterGroup = L.markerClusterGroup ? L.markerClusterGroup() : L.layerGroup();
     layer.eachLayer((l) => { if (l instanceof L.CircleMarker || l instanceof L.Marker) clusterGroup.addLayer(l); });
     layer.addTo(App.map);
-    App.mapLayers[name + '_' + Date.now()] = layer;
+    App.mapLayers[key] = layer;
     try { App.map.fitBounds(layer.getBounds(), { maxZoom: 17 }); } catch (e) {}
     refreshLayerList();
   }
@@ -642,6 +667,9 @@
         el('button', { class: 'icon-btn btn-icon-only', style: 'margin-left:auto;width:26px;height:26px;', onclick: () => {
           App.map.removeLayer(App.mapLayers[key]);
           delete App.mapLayers[key];
+          // FIX #2: hapus juga dari penyimpanan persisten, supaya tidak
+          // muncul kembali saat modul Mapping dibuka ulang.
+          if (App.importedGeoJson) delete App.importedGeoJson[key];
           refreshLayerList();
         } }, [el('i', { class: 'fa-solid fa-trash', style: 'font-size:11px' })]),
       ]);
@@ -2315,7 +2343,13 @@
       if (App.summaryMap) { try { App.summaryMap.remove(); } catch (e) {} App.summaryMap = null; }
       const map = L.map(mapEl, { zoomControl: true }).setView(CFG.DEFAULT_CENTER, CFG.DEFAULT_ZOOM);
       App.summaryMap = map;
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap', maxZoom: 20 }).addTo(map);
+      // FIX #4: sediakan basemap Satelit (Esri) sebagai default + toggle,
+      // supaya hasil analisa (jumlah bangunan/rumah) bisa dicek visual
+      // langsung terhadap citra satelit, bukan hanya peta garis jalan.
+      const baseOSM = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap', maxZoom: 20 });
+      const baseSat = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { attribution: 'Tiles &copy; Esri', maxZoom: 20 });
+      baseSat.addTo(map);
+      L.control.layers({ 'Satelit (Esri)': baseSat, 'Jalan (OSM)': baseOSM }, {}, { position: 'topright' }).addTo(map);
 
       const layers = {};
       // Boundary
@@ -2673,7 +2707,12 @@
     const R = App._review;
     const map = L.map(mapEl, { zoomControl: true }).setView(CFG.DEFAULT_CENTER, CFG.DEFAULT_ZOOM);
     App.reviewMap = map;
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap', maxZoom: 20 }).addTo(map);
+    // FIX #4: basemap Satelit (Esri) sebagai default + toggle (lihat catatan
+    // yang sama di buildSummaryMap).
+    const baseOSMReview = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap', maxZoom: 20 });
+    const baseSatReview = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { attribution: 'Tiles &copy; Esri', maxZoom: 20 });
+    baseSatReview.addTo(map);
+    L.control.layers({ 'Satelit (Esri)': baseSatReview, 'Jalan (OSM)': baseOSMReview }, {}, { position: 'topright' }).addTo(map);
 
     const groups = {
       'Detected Buildings': L.layerGroup(), 'Home Passed': L.layerGroup(), 'Planning ODP': L.layerGroup(),

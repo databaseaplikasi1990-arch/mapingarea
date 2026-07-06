@@ -339,6 +339,9 @@
 
     renderActivityList();
     renderCoverageChart();
+    try { await injectPlanningDashboard(container); } catch (e) { /* aman bila migration 007 belum dijalankan */ }
+    try { await injectBuildingCategories(container); } catch (e) { /* aman bila migration 008 belum dijalankan */ }
+    try { await injectAssetManagementDashboard(container); } catch (e) { /* aman bila migration 011 belum dijalankan */ }
   });
 
   async function loadDashboardStats() {
@@ -408,6 +411,9 @@
       el('button', { class: 'btn btn-primary btn-sm', onclick: () => App.runAreaAnalysis && App.runAreaAnalysis(null) }, [
         el('i', { class: 'fa-solid fa-wand-magic-sparkles' }), ' Analisa Area',
       ]),
+      el('button', { class: 'btn btn-secondary btn-sm', onclick: () => toggleMeasureTool() }, [
+        el('i', { class: 'fa-solid fa-ruler' }), ' Ukur Jarak/Area',
+      ]),
     ]));
 
     const layout = el('div', { class: 'map-page-layout' });
@@ -423,9 +429,6 @@
     initMap(mapWrap);
   }, function destroyMapping() {
     if (App.map) { App.map.remove(); App.map = null; }
-    // CATATAN FIX: jangan hapus App.importedGeoJson (data mentah import).
-    // App.mapLayers hanya menyimpan instance Leaflet layer yang terikat ke
-    // instance map yang baru saja di-destroy, jadi aman di-reset di sini.
     App.mapLayers = {};
   });
 
@@ -444,16 +447,6 @@
     const initialBase = CFG.MAP_PROVIDER === 'satellite' ? baseLayers['Satelit (Esri)'] : baseLayers['Jalan (OSM)'];
     initialBase.addTo(App.map);
     L.control.layers(baseLayers, {}, { position: 'topright' }).addTo(App.map);
-
-    // FIX #2: pulihkan layer hasil import sebelumnya (tersimpan di
-    // App.importedGeoJson, yang TIDAK ikut dihapus saat modul Mapping
-    // di-destroy) supaya tidak hilang ketika pindah menu lalu kembali lagi.
-    if (App.importedGeoJson) {
-      Object.keys(App.importedGeoJson).forEach((key) => {
-        const item = App.importedGeoJson[key];
-        renderGeoJsonLayer(key, item.name, item.geojson);
-      });
-    }
 
     // Toolbar float kiri-atas
     const floatBar = el('div', { class: 'map-toolbar-float' }, [
@@ -487,6 +480,56 @@
       },
       () => toast('Gagal mendapatkan lokasi. Periksa izin lokasi browser.', 'error')
     );
+  }
+
+  // ---- Measurement Tool (jarak & area) — menutup celah FINAL_AUDIT_REPORT.md ----
+  // Klik berturut-turut di peta untuk menambah titik; jarak berjalan & (bila
+  // ≥3 titik) luas ditampilkan live di tooltip mengambang. Klik tombol lagi
+  // atau tombol "Selesai" pada tooltip untuk mengakhiri sesi ukur.
+  App._measure = null;
+  function toggleMeasureTool() {
+    if (App._measure) { stopMeasureTool(); return; }
+    if (!App.map) { toast('Buka halaman Mapping dahulu.', 'warning'); return; }
+    const t = window.turf;
+    if (!t) { toast('Turf.js belum termuat.', 'error'); return; }
+    const pts = [];
+    const line = L.polyline([], { color: '#B3261E', weight: 3, dashArray: '6,6' }).addTo(App.map);
+    const markers = L.layerGroup().addTo(App.map);
+    const label = L.control({ position: 'bottomleft' });
+    label.onAdd = function () {
+      const div = L.DomUtil.create('div', 'card');
+      div.id = 'measure-readout';
+      div.style.cssText = 'padding:8px 12px;font-size:12px;box-shadow:var(--shadow-md);';
+      div.innerHTML = 'Klik di peta untuk mulai mengukur. Klik tombol "Ukur Jarak/Area" lagi untuk selesai.';
+      return div;
+    };
+    label.addTo(App.map);
+    function updateReadout() {
+      const div = document.getElementById('measure-readout'); if (!div) return;
+      if (pts.length < 2) { div.innerHTML = 'Titik: ' + pts.length + ' — klik lagi untuk menambah.'; return; }
+      let distM = 0;
+      try { distM = t.length(t.lineString(pts), { units: 'kilometers' }) * 1000; } catch (e) {}
+      let areaTxt = '';
+      if (pts.length >= 3) {
+        try { const ring = pts.concat([pts[0]]); const areaM2 = t.area(t.polygon([ring])); areaTxt = ' | Luas ≈ ' + fmtNumber(Math.round(areaM2)) + ' m² (' + (areaM2 / 1e6).toFixed(4) + ' km²)'; } catch (e) {}
+      }
+      div.innerHTML = 'Jarak ≈ ' + fmtNumber(Math.round(distM)) + ' m' + areaTxt + ' — <b>' + pts.length + ' titik</b>';
+    }
+    const clickHandler = (e) => {
+      pts.push([e.latlng.lng, e.latlng.lat]);
+      line.setLatLngs(pts.map((p) => [p[1], p[0]]));
+      markers.addLayer(L.circleMarker(e.latlng, { radius: 4, color: '#B3261E', fillOpacity: 1 }));
+      updateReadout();
+    };
+    App.map.on('click', clickHandler);
+    App._measure = { line, markers, label, clickHandler };
+    toast('Mode ukur aktif. Klik di peta untuk menambah titik.', 'info', 4000);
+  }
+  function stopMeasureTool() {
+    const M = App._measure; if (!M) return;
+    try { App.map.off('click', M.clickHandler); App.map.removeLayer(M.line); App.map.removeLayer(M.markers); App.map.removeControl(M.label); } catch (e) {}
+    App._measure = null;
+    toast('Mode ukur dimatikan.', 'info');
   }
 
   // ---- Gambar Polygon/Garis di peta (leaflet.draw) --------------------
@@ -610,18 +653,6 @@
 
   function addGeoJsonLayer(name, geojson) {
     if (!App.map) return;
-    // FIX #2: simpan data mentah di penyimpanan yang PERSISTEN lintas
-    // buka-tutup modul Mapping (tidak di-reset di destroyMapping), supaya
-    // saat user pindah menu lalu kembali ke Mapping, layer bisa digambar
-    // ulang dari sini alih-alih hilang begitu saja.
-    if (!App.importedGeoJson) App.importedGeoJson = {};
-    const key = name + '_' + Date.now();
-    App.importedGeoJson[key] = { name, geojson };
-    renderGeoJsonLayer(key, name, geojson);
-  }
-
-  function renderGeoJsonLayer(key, name, geojson) {
-    if (!App.map) return;
     const color = randomLayerColor();
     const layer = L.geoJSON(geojson, {
       style: { color, weight: 2, fillOpacity: 0.15 },
@@ -637,7 +668,7 @@
     const clusterGroup = L.markerClusterGroup ? L.markerClusterGroup() : L.layerGroup();
     layer.eachLayer((l) => { if (l instanceof L.CircleMarker || l instanceof L.Marker) clusterGroup.addLayer(l); });
     layer.addTo(App.map);
-    App.mapLayers[key] = layer;
+    App.mapLayers[name + '_' + Date.now()] = layer;
     try { App.map.fitBounds(layer.getBounds(), { maxZoom: 17 }); } catch (e) {}
     refreshLayerList();
   }
@@ -667,9 +698,6 @@
         el('button', { class: 'icon-btn btn-icon-only', style: 'margin-left:auto;width:26px;height:26px;', onclick: () => {
           App.map.removeLayer(App.mapLayers[key]);
           delete App.mapLayers[key];
-          // FIX #2: hapus juga dari penyimpanan persisten, supaya tidak
-          // muncul kembali saat modul Mapping dibuka ulang.
-          if (App.importedGeoJson) delete App.importedGeoJson[key];
           refreshLayerList();
         } }, [el('i', { class: 'fa-solid fa-trash', style: 'font-size:11px' })]),
       ]);
@@ -2067,13 +2095,38 @@
     ]);
     wizardItem.addEventListener('click', () => { location.hash = '#/planning-wizard?step=1'; });
 
+    // Menu tahap FINAL (Implementation 04): Validation, Versi, Reports.
+    const mkItem = (route, icon, label, hash) => {
+      const it = el('div', { class: 'nav-item', 'data-route': route, title: label }, [el('i', { class: 'fa-solid ' + icon }), el('span', { class: 'nav-item-label' }, [label])]);
+      it.addEventListener('click', () => { location.hash = hash; });
+      return it;
+    };
+    const validationItem = mkItem('planning-validation', 'fa-clipboard-check', 'Validation', '#/planning-validation');
+    const versionsItem = mkItem('planning-versions', 'fa-layer-group', 'Versi Planning', '#/planning-versions');
+    const reportsItem = mkItem('planning-reports', 'fa-file-lines', 'Reports & Export', '#/planning-reports');
+    const proposalItem = mkItem('planning-proposal', 'fa-file-contract', 'Proposal & BOQ Final', '#/planning-proposal');
+    const assetMgmtItem = mkItem('asset-management', 'fa-toolbox', 'Asset Management', '#/asset-management');
+    const globalMapItem = mkItem('global-map', 'fa-earth-asia', 'Global Map', '#/global-map');
+    const assetReportsItem = mkItem('asset-reports', 'fa-file-shield', 'Asset & QC Reports', '#/asset-reports');
+    const backupItem = mkItem('backup-restore', 'fa-database', 'Backup & Restore', '#/backup-restore');
+    const detectedItem = mkItem('detected-buildings', 'fa-buildings', 'Detected Buildings', '#/detected-buildings');
+
     // Taruh dalam grup tersendiri di paling bawah agar tidak menggeser menu lain.
     const group = el('div', { class: 'nav-group' }, [
       el('div', { class: 'nav-group-title' }, ['Smart FTTH']),
     ]);
     group.appendChild(item);
+    if (!nav.querySelector('[data-route="detected-buildings"]')) group.appendChild(detectedItem);
     if (!nav.querySelector('[data-route="planning-wizard"]')) group.appendChild(wizardItem);
     if (!nav.querySelector('[data-route="planning-summary"]')) group.appendChild(summaryItem);
+    if (!nav.querySelector('[data-route="planning-validation"]')) group.appendChild(validationItem);
+    if (!nav.querySelector('[data-route="planning-versions"]')) group.appendChild(versionsItem);
+    if (!nav.querySelector('[data-route="planning-reports"]')) group.appendChild(reportsItem);
+    if (!nav.querySelector('[data-route="planning-proposal"]')) group.appendChild(proposalItem);
+    if (!nav.querySelector('[data-route="asset-management"]')) group.appendChild(assetMgmtItem);
+    if (!nav.querySelector('[data-route="global-map"]')) group.appendChild(globalMapItem);
+    if (!nav.querySelector('[data-route="asset-reports"]')) group.appendChild(assetReportsItem);
+    if (!nav.querySelector('[data-route="backup-restore"]')) group.appendChild(backupItem);
     nav.appendChild(group);
   }
   App.injectSmartPlanningNav = injectSmartPlanningNav;
@@ -2178,42 +2231,38 @@
     const analysisId = await saveAnalysisToDb(projectId, result);
     if (analysisId) { App._lastAnalysis.id = analysisId; toast('Analisa selesai & tersimpan.', 'success'); }
     else { toast('Analisa selesai (belum tersimpan — jalankan migration 005).', 'warning', 5000); }
+    // Revision 01: buat record per-bangunan ke detected_buildings (bukan tabel homes).
+    if (analysisId) { try { const n = await saveDetectedBuildings(analysisId, projectId, result.buildings.featureCollection); if (n) toast(fmtNumber(n) + ' bangunan tersimpan ke Detected Buildings.', 'info', 4000); } catch (e) { console.warn('[DetectedBuildings]', e && e.message); } }
     return { result, analysisId };
   }
   App.performBoundaryAnalysis = performBoundaryAnalysis;
+
+  // Simpan hasil deteksi bangunan (chunked). Return jumlah tersimpan | 0.
+  async function saveDetectedBuildings(analysisId, projectId, buildingsFC) {
+    const gen = window.PlanningEngine && window.PlanningEngine.generators;
+    if (!gen || typeof gen.buildDetectedRecords !== 'function') return 0;
+    const recs = gen.buildDetectedRecords(buildingsFC, {});
+    if (!recs.length) return 0;
+    const planner = (App.profile && App.profile.full_name) || 'Pengguna';
+    const createdBy = (App.session && App.session.user) ? App.session.user.id : null;
+    const rows = recs.map((r) => Object.assign({ analysis_id: analysisId, project_id: projectId || null, planner, created_by: createdBy }, r));
+    let saved = 0;
+    try {
+      for (let i = 0; i < rows.length; i += 500) {
+        const { error } = await App.supabase.from('detected_buildings').insert(rows.slice(i, i + 500));
+        if (error) throw error;
+        saved += Math.min(500, rows.length - i);
+      }
+    } catch (err) { console.warn('[DetectedBuildings] gagal simpan (migration 008?):', err.message); return 0; }
+    return saved;
+  }
+  App.saveDetectedBuildings = saveDetectedBuildings;
 
   // Entry point tombol "Analisa Area". projectId opsional.
   async function runAreaAnalysis(projectId) {
     const out = await performBoundaryAnalysis(projectId);
     if (!out) { if (!getBoundaryFromMap()) location.hash = '#/mapping'; return; }
     location.hash = out.analysisId ? ('#/planning-summary?analysis=' + out.analysisId) : '#/planning-summary';
-  }
-  App.runAreaAnalysis = runAreaAnalysis;
-
-  // (versi lama runAreaAnalysis digantikan; logika inti pindah ke performBoundaryAnalysis)
-  async function _deprecatedRunAreaAnalysis(projectId) {
-    const engine = window.PlanningEngine;
-    if (!engine || typeof engine.analyze !== 'function') {
-      toast('Planning Engine belum termuat (planning-analyzers.js).', 'error'); return;
-    }
-    const boundary = getBoundaryFromMap();
-    if (!boundary) {
-      toast('Belum ada polygon di peta. Import KMZ/KML atau gambar polygon dulu di halaman Map.', 'warning', 5000);
-      location.hash = '#/mapping';
-      return;
-    }
-    toast('Menganalisa area...', 'info');
-    let result;
-    try {
-      result = await engine.analyze(boundary, {});
-    } catch (err) {
-      console.error(err); toast('Analisa gagal: ' + err.message, 'error'); return;
-    }
-    App._lastAnalysis = { projectId: projectId || null, result };
-    const analysisId = await saveAnalysisToDb(projectId, result);
-    if (analysisId) { App._lastAnalysis.id = analysisId; toast('Analisa selesai & tersimpan.', 'success'); }
-    else { toast('Analisa selesai (belum tersimpan — jalankan migration 005).', 'warning', 5000); }
-    location.hash = analysisId ? ('#/planning-summary?analysis=' + analysisId) : '#/planning-summary';
   }
   App.runAreaAnalysis = runAreaAnalysis;
 
@@ -2343,13 +2392,7 @@
       if (App.summaryMap) { try { App.summaryMap.remove(); } catch (e) {} App.summaryMap = null; }
       const map = L.map(mapEl, { zoomControl: true }).setView(CFG.DEFAULT_CENTER, CFG.DEFAULT_ZOOM);
       App.summaryMap = map;
-      // FIX #4: sediakan basemap Satelit (Esri) sebagai default + toggle,
-      // supaya hasil analisa (jumlah bangunan/rumah) bisa dicek visual
-      // langsung terhadap citra satelit, bukan hanya peta garis jalan.
-      const baseOSM = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap', maxZoom: 20 });
-      const baseSat = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { attribution: 'Tiles &copy; Esri', maxZoom: 20 });
-      baseSat.addTo(map);
-      L.control.layers({ 'Satelit (Esri)': baseSat, 'Jalan (OSM)': baseOSM }, {}, { position: 'topright' }).addTo(map);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap', maxZoom: 20 }).addTo(map);
 
       const layers = {};
       // Boundary
@@ -2494,15 +2537,6 @@
   }
   App.runGenerate = runGenerate;
 
-  async function approveGeneration(analysisId, generationId) {
-    try {
-      await App.supabase.from('planning_boq').update({ status: 'approved' }).eq('analysis_id', analysisId).eq('generation_id', generationId);
-      await App.supabase.from('planning_analysis').update({ status: 'approved' }).eq('id', analysisId);
-      toast('Draft disetujui (approved).', 'success');
-      return true;
-    } catch (e) { toast('Approve gagal disimpan (migration 006?). Status lokal ditandai approved.', 'warning', 4500); return false; }
-  }
-
   // ---------- WIZARD ----------
   const WIZARD_STEPS = ['Import KMZ', 'Analisa Area', 'Generate Planning', 'Planner Review', 'Approval'];
   ROUTE_TITLES['planning-wizard'] = 'Smart Planning Wizard';
@@ -2625,16 +2659,20 @@
           el('p', { class: 'text-muted' }, ['Tinjau ringkasan akhir lalu setujui draft. Setelah approve, hasil siap masuk tahap export (fase berikutnya).']),
         ]);
         card.appendChild(boqTable(g.boq));
-        card.appendChild(el('div', { style: 'display:flex;gap:8px;margin-top:10px;' }, [
+        card.appendChild(el('div', { style: 'display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;' }, [
           el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { location.hash = wizardHash(4, analysisId); } }, ['← Kembali ke Review']),
-          el('button', { class: 'btn btn-primary btn-sm', onclick: async () => { await approveGeneration(App._lastGeneration.analysisId, g.generation_id); } }, [el('i', { class: 'fa-solid fa-circle-check' }), ' Setujui (Approve)']),
+          el('button', { class: 'btn btn-primary btn-sm', onclick: async () => { const v = await createPlanningVersion(); if (v) location.hash = '#/planning-validation?version=' + v.id; } }, [el('i', { class: 'fa-solid fa-code-branch' }), ' Simpan sebagai Versi → Validasi']),
+          el('button', { class: 'btn btn-ghost btn-sm', onclick: () => { location.hash = '#/planning-versions' + (analysisId ? ('?analysis=' + analysisId) : ''); } }, [el('i', { class: 'fa-solid fa-layer-group' }), ' Daftar Versi']),
+          el('button', { class: 'btn btn-ghost btn-sm', onclick: () => { location.hash = '#/planning-reports'; } }, [el('i', { class: 'fa-solid fa-file-lines' }), ' Reports & Export']),
         ]));
+        card.appendChild(el('p', { class: 'text-xs text-muted', style: 'margin-top:8px;' }, ['Alur final: simpan sebagai Versi → Planner Validation → Supervisor Approval → Final → Report/Export.']));
         body.appendChild(card);
       }
     }
   }, function destroyWizard() {
     if (App.reviewMap) { try { App.reviewMap.remove(); } catch (e) {} App.reviewMap = null; }
     App._reviewLayers = null;
+    stopAutosave();
   });
 
   // Ringkasan hasil generate (kartu + BOQ).
@@ -2679,8 +2717,13 @@
       buildingsFC: g.buildingsFC, homePassedFC: g.homePassedFC,
       odps: g.odps.map((o) => Object.assign({}, o)), odcs: g.odcs.map((o) => Object.assign({}, o)),
       backbone: g.backbone, distribution: g.distribution, poles: g.poles, boq: g.boq,
-      addMode: null,
+      addMode: null, mode: 'review', locked: false,
     };
+    // REVISION 03: riwayat perubahan ODP/ODC di Review Mode (Undo/Redo).
+    // Snapshot ringan (hanya odps/odcs — sumber kebenaran sebelum Regenerate).
+    App._reviewHistory = { stack: [cloneOdpOdc(App._review)], index: 0 };
+    App._reviewDirty = false;
+    startAutosave();
 
     const card = el('div', { class: 'card' }, [el('div', { class: 'card-header' }, [el('h3', {}, ['Step 4 — Planner Review'])])]);
     const layerBar = el('div', { style: 'display:flex;gap:12px;flex-wrap:wrap;margin-bottom:8px;' });
@@ -2692,13 +2735,105 @@
     body.appendChild(card);
 
     const btn = (label, icon, cls, cb) => el('button', { class: 'btn ' + cls + ' btn-sm', onclick: cb }, [el('i', { class: 'fa-solid ' + icon }), ' ' + label]);
-    toolBar.appendChild(btn('Tambah ODP', 'fa-plus', 'btn-secondary', () => { App._review.addMode = App._review.addMode === 'odp' ? null : 'odp'; toast(App._review.addMode ? 'Klik peta untuk menaruh ODP.' : 'Mode tambah dimatikan.', 'info'); }));
-    toolBar.appendChild(btn('Tambah ODC', 'fa-plus', 'btn-secondary', () => { App._review.addMode = App._review.addMode === 'odc' ? null : 'odc'; toast(App._review.addMode ? 'Klik peta untuk menaruh ODC.' : 'Mode tambah dimatikan.', 'info'); }));
+
+    // Mode peta (Planning/Review/Approval) + kunci layer.
+    const modeSel = el('select', { class: 'text-input', style: 'max-width:170px;', onchange: (e) => { App._review.mode = e.target.value; toast('Mode peta: ' + e.target.value + (App._review.mode === 'approval' ? ' (baca-saja)' : ''), 'info'); if (App._reviewRedraw) { App._reviewRedraw.odp(); App._reviewRedraw.odc(); } } }, [
+      el('option', { value: 'planning' }, ['Planning Mode']),
+      el('option', { value: 'review', selected: 'selected' }, ['Review Mode']),
+      el('option', { value: 'approval' }, ['Approval Mode (kunci)']),
+    ]);
+    const lockCb = el('label', { style: 'display:inline-flex;align-items:center;gap:6px;font-size:12px;' }, [
+      el('input', { type: 'checkbox', onchange: (e) => { App._review.locked = e.target.checked; (App._reviewLayerInputs || []).forEach((inp) => { inp.disabled = e.target.checked; }); toast(e.target.checked ? 'Layer & edit dikunci.' : 'Kunci dilepas.', 'info'); if (App._reviewRedraw) { App._reviewRedraw.odp(); App._reviewRedraw.odc(); } } }),
+      el('span', {}, ['Kunci layer/edit']),
+    ]);
+    toolBar.appendChild(el('div', { style: 'display:flex;gap:8px;align-items:center;' }, [modeSel, lockCb]));
+    toolBar.appendChild(btn('Tambah ODP', 'fa-plus', 'btn-secondary', () => { if (!reviewEditable()) { toast('Mode saat ini baca-saja/dikunci.', 'warning'); return; } App._review.addMode = App._review.addMode === 'odp' ? null : 'odp'; toast(App._review.addMode ? 'Klik peta untuk menaruh ODP.' : 'Mode tambah dimatikan.', 'info'); }));
+    toolBar.appendChild(btn('Tambah ODC', 'fa-plus', 'btn-secondary', () => { if (!reviewEditable()) { toast('Mode saat ini baca-saja/dikunci.', 'warning'); return; } App._review.addMode = App._review.addMode === 'odc' ? null : 'odc'; toast(App._review.addMode ? 'Klik peta untuk menaruh ODC.' : 'Mode tambah dimatikan.', 'info'); }));
+    toolBar.appendChild(btn('Undo', 'fa-rotate-left', 'btn-ghost', () => undoReview()));
+    toolBar.appendChild(btn('Redo', 'fa-rotate-right', 'btn-ghost', () => redoReview()));
+    toolBar.appendChild(el('span', { id: 'autosave-indicator', class: 'text-xs text-muted', style: 'margin-left:8px;' }, ['Auto Save aktif']));
     toolBar.appendChild(btn('Regenerate Jalur & BOQ', 'fa-rotate', 'btn-secondary', () => { regenerateReview(boqBox); }));
     toolBar.appendChild(btn('Simpan Revisi', 'fa-floppy-disk', 'btn-primary', () => saveReview()));
     toolBar.appendChild(btn('Lanjut ke Approval →', 'fa-arrow-right', 'btn-secondary', () => { location.hash = wizardHash(5, analysisId); }));
 
     setTimeout(() => buildReviewMap(mapEl, layerBar, boqBox), 60);
+  }
+
+  function reviewEditable() { const R = App._review; return !!R && !R.locked && R.mode !== 'approval'; }
+
+  // ---------- REVISION 03: REVISION HISTORY (Undo/Redo/Restore/Compare) ----------
+  // Undo/Redo di sini beroperasi pada state ODP/ODC Review Mode (in-memory,
+  // per sesi). "Restore" antar-VERSI TERSIMPAN (planning_version) ada di
+  // modul planning-versions (tombol Restore pada tabel versi). "Compare
+  // Revision" juga di planning-versions (PlanningFinal.versionDiff).
+  function cloneOdpOdc(R) {
+    return { odps: (R.odps || []).map((o) => Object.assign({}, o)), odcs: (R.odcs || []).map((o) => Object.assign({}, o)) };
+  }
+  // Snap manual 1 titik (ODP/ODC) ke titik terdekat pada jalur jalan
+  // (R.roadsFC) — menutup celah "Snap to Road" dari FINAL_AUDIT_REPORT.md.
+  function snapPointToRoad(point) {
+    const R = App._review; const t = window.turf;
+    if (!t || !R || !R.roadsFC || !R.roadsFC.features || !R.roadsFC.features.length) { toast('Data jalan tidak tersedia untuk snapping.', 'warning'); return; }
+    pushReviewHistory();
+    const pt = t.point([point.lng, point.lat]);
+    let best = null, bestDist = Infinity;
+    R.roadsFC.features.forEach((f) => {
+      if (!f.geometry || f.geometry.type !== 'LineString') return;
+      try {
+        const snapped = t.nearestPointOnLine(f, pt, { units: 'meters' });
+        if (snapped.properties.dist < bestDist) { bestDist = snapped.properties.dist; best = snapped; }
+      } catch (e) {}
+    });
+    if (!best) { toast('Tidak ditemukan jalur jalan terdekat.', 'warning'); return; }
+    point.lat = best.geometry.coordinates[1];
+    point.lng = best.geometry.coordinates[0];
+    toast('Titik di-snap ke jalan (bergeser ≈ ' + Math.round(bestDist) + ' m).', 'success');
+  }
+  function pushReviewHistory() {
+    const H = App._reviewHistory; if (!H) return;
+    // Buang cabang redo yang sudah usang begitu ada perubahan baru.
+    H.stack = H.stack.slice(0, H.index + 1);
+    H.stack.push(cloneOdpOdc(App._review));
+    H.index = H.stack.length - 1;
+    if (H.stack.length > 50) { H.stack.shift(); H.index--; } // batasi memori
+    App._reviewDirty = true; // AUTO SAVE: tandai ada perubahan yang belum tersimpan
+  }
+
+  // ---------- AUTO SAVE (REVISION FINAL — menutup celah dari FINAL_AUDIT_REPORT.md) ----------
+  // Planner tidak boleh kehilangan pekerjaan: selama Review Mode terbuka, tiap
+  // 30 detik SEKALI, jika ada perubahan (App._reviewDirty) yang belum tersimpan,
+  // sistem otomatis menyimpan draft baru (silent, tidak mengganggu dengan toast
+  // besar) dan menampilkan indikator kecil "Tersimpan otomatis HH:MM:SS".
+  function startAutosave() {
+    stopAutosave();
+    App.autosaveTimer = setInterval(async () => {
+      if (!App._review || !App._reviewDirty) return;
+      try {
+        await saveReview(true /* silent */);
+        App._reviewDirty = false;
+        const ind = document.getElementById('autosave-indicator');
+        if (ind) ind.textContent = 'Tersimpan otomatis ' + new Date().toLocaleTimeString('id-ID');
+      } catch (e) { /* biarkan, akan dicoba lagi di interval berikutnya */ }
+    }, 30000);
+  }
+  function stopAutosave() {
+    if (App.autosaveTimer) { clearInterval(App.autosaveTimer); App.autosaveTimer = null; }
+  }
+  function undoReview() {
+    const H = App._reviewHistory; if (!H || H.index <= 0) { toast('Tidak ada riwayat sebelumnya.', 'info'); return; }
+    H.index--;
+    const snap = cloneOdpOdc(H.stack[H.index]);
+    App._review.odps = snap.odps; App._review.odcs = snap.odcs;
+    if (App._reviewRedraw) { App._reviewRedraw.odp(); App._reviewRedraw.odc(); }
+    toast('Undo.', 'info');
+  }
+  function redoReview() {
+    const H = App._reviewHistory; if (!H || H.index >= H.stack.length - 1) { toast('Tidak ada riwayat berikutnya.', 'info'); return; }
+    H.index++;
+    const snap = cloneOdpOdc(H.stack[H.index]);
+    App._review.odps = snap.odps; App._review.odcs = snap.odcs;
+    if (App._reviewRedraw) { App._reviewRedraw.odp(); App._reviewRedraw.odc(); }
+    toast('Redo.', 'info');
   }
 
   function buildReviewMap(mapEl, layerBar, boqBox) {
@@ -2707,12 +2842,7 @@
     const R = App._review;
     const map = L.map(mapEl, { zoomControl: true }).setView(CFG.DEFAULT_CENTER, CFG.DEFAULT_ZOOM);
     App.reviewMap = map;
-    // FIX #4: basemap Satelit (Esri) sebagai default + toggle (lihat catatan
-    // yang sama di buildSummaryMap).
-    const baseOSMReview = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap', maxZoom: 20 });
-    const baseSatReview = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { attribution: 'Tiles &copy; Esri', maxZoom: 20 });
-    baseSatReview.addTo(map);
-    L.control.layers({ 'Satelit (Esri)': baseSatReview, 'Jalan (OSM)': baseOSMReview }, {}, { position: 'topright' }).addTo(map);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap', maxZoom: 20 }).addTo(map);
 
     const groups = {
       'Detected Buildings': L.layerGroup(), 'Home Passed': L.layerGroup(), 'Planning ODP': L.layerGroup(),
@@ -2736,12 +2866,16 @@
     function redrawOdp() {
       groups['Planning ODP'].clearLayers(); groups['Coverage Radius'].clearLayers();
       R.odps.forEach((o, idx) => {
-        const m = L.marker([o.lat, o.lng], { draggable: true, title: o.odp_id });
+        const m = L.marker([o.lat, o.lng], { draggable: reviewEditable(), title: o.odp_id });
         m.bindTooltip(o.odp_id + ' (' + (o.home_count || 0) + ')', { permanent: false });
-        m.on('dragend', (e) => { const ll = e.target.getLatLng(); o.lat = ll.lat; o.lng = ll.lng; });
+        m.on('dragend', (e) => { pushReviewHistory(); const ll = e.target.getLatLng(); o.lat = ll.lat; o.lng = ll.lng; });
         m.on('click', () => {
-          m.bindPopup('<b>' + o.odp_id + '</b><br>Home: ' + (o.home_count || 0) + '<br><button id="del-odp-' + idx + '" class="btn btn-danger btn-sm" style="margin-top:6px;">Hapus ODP</button>').openPopup();
-          setTimeout(() => { const b = document.getElementById('del-odp-' + idx); if (b) b.onclick = () => { R.odps.splice(idx, 1); redrawOdp(); map.closePopup(); toast('ODP dihapus. Klik Regenerate.', 'info'); }; }, 30);
+          if (!reviewEditable()) { m.bindPopup('<b>' + o.odp_id + '</b><br>Home: ' + (o.home_count || 0) + '<br><span style="color:#888;">baca-saja</span>').openPopup(); return; }
+          m.bindPopup('<b>' + o.odp_id + '</b><br>Home: ' + (o.home_count || 0) + '<br><button id="del-odp-' + idx + '" class="btn btn-danger btn-sm" style="margin-top:6px;">Hapus ODP</button> <button id="snap-odp-' + idx + '" class="btn btn-secondary btn-sm" style="margin-top:6px;">Snap ke Jalan</button>').openPopup();
+          setTimeout(() => {
+            const b = document.getElementById('del-odp-' + idx); if (b) b.onclick = () => { pushReviewHistory(); R.odps.splice(idx, 1); redrawOdp(); map.closePopup(); toast('ODP dihapus. Klik Regenerate.', 'info'); };
+            const s = document.getElementById('snap-odp-' + idx); if (s) s.onclick = () => { snapPointToRoad(o); redrawOdp(); map.closePopup(); };
+          }, 30);
         });
         m.addTo(groups['Planning ODP']);
         if (o.coverage_radius_m) L.circle([o.lat, o.lng], { radius: o.coverage_radius_m, color: '#0B6E99', weight: 1, fillOpacity: 0.06 }).addTo(groups['Coverage Radius']);
@@ -2750,12 +2884,16 @@
     function redrawOdc() {
       groups['Planning ODC'].clearLayers();
       R.odcs.forEach((o, idx) => {
-        const m = L.marker([o.lat, o.lng], { draggable: true, title: o.odc_id });
+        const m = L.marker([o.lat, o.lng], { draggable: reviewEditable(), title: o.odc_id });
         m.bindTooltip(o.odc_id + ' (' + (o.odp_count || 0) + ' ODP)', { permanent: false });
-        m.on('dragend', (e) => { const ll = e.target.getLatLng(); o.lat = ll.lat; o.lng = ll.lng; });
+        m.on('dragend', (e) => { pushReviewHistory(); const ll = e.target.getLatLng(); o.lat = ll.lat; o.lng = ll.lng; });
         m.on('click', () => {
-          m.bindPopup('<b>' + o.odc_id + '</b><br>ODP: ' + (o.odp_count || 0) + '<br><button id="del-odc-' + idx + '" class="btn btn-danger btn-sm" style="margin-top:6px;">Hapus ODC</button>').openPopup();
-          setTimeout(() => { const b = document.getElementById('del-odc-' + idx); if (b) b.onclick = () => { R.odcs.splice(idx, 1); redrawOdc(); map.closePopup(); toast('ODC dihapus. Klik Regenerate.', 'info'); }; }, 30);
+          if (!reviewEditable()) { m.bindPopup('<b>' + o.odc_id + '</b><br>ODP: ' + (o.odp_count || 0) + '<br><span style="color:#888;">baca-saja</span>').openPopup(); return; }
+          m.bindPopup('<b>' + o.odc_id + '</b><br>ODP: ' + (o.odp_count || 0) + '<br><button id="del-odc-' + idx + '" class="btn btn-danger btn-sm" style="margin-top:6px;">Hapus ODC</button> <button id="snap-odc-' + idx + '" class="btn btn-secondary btn-sm" style="margin-top:6px;">Snap ke Jalan</button>').openPopup();
+          setTimeout(() => {
+            const b = document.getElementById('del-odc-' + idx); if (b) b.onclick = () => { pushReviewHistory(); R.odcs.splice(idx, 1); redrawOdc(); map.closePopup(); toast('ODC dihapus. Klik Regenerate.', 'info'); };
+            const s = document.getElementById('snap-odc-' + idx); if (s) s.onclick = () => { snapPointToRoad(o); redrawOdc(); map.closePopup(); };
+          }, 30);
         });
         m.addTo(groups['Planning ODC']);
       });
@@ -2766,23 +2904,24 @@
 
     // Klik peta untuk menambah ODP/ODC dalam mode tambah.
     map.on('click', (e) => {
-      if (!R.addMode) return;
+      if (!R.addMode || !reviewEditable()) return;
       const ll = e.latlng;
+      pushReviewHistory();
       if (R.addMode === 'odp') { R.odps.push({ odp_id: 'ODP-N' + (R.odps.length + 1), lat: ll.lat, lng: ll.lng, home_count: 0, home_ids: [], coverage_radius_m: 40 }); redrawOdp(); }
       else { R.odcs.push({ odc_id: 'ODC-N' + (R.odcs.length + 1), lat: ll.lat, lng: ll.lng, odp_count: 0, odp_ids: [] }); redrawOdc(); }
       toast('Ditambahkan. Klik Regenerate untuk memperbarui jalur & BOQ.', 'info');
     });
 
     // Toggle layer.
+    App._reviewLayerInputs = [];
     const order = ['Detected Buildings', 'Home Passed', 'Coverage Radius', 'Planning Backbone', 'Planning Distribution', 'Planning ODP', 'Planning ODC'];
     const defaultOn = { 'Planning ODP': 1, 'Planning ODC': 1, 'Planning Backbone': 1, 'Planning Distribution': 1, 'Home Passed': 1 };
     order.forEach((name) => {
       const grp = groups[name]; const on = !!defaultOn[name];
       if (on) grp.addTo(map);
-      const cb = el('label', { style: 'display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;' }, [
-        el('input', { type: 'checkbox', checked: on ? 'checked' : null, onchange: (ev) => { if (ev.target.checked) map.addLayer(grp); else map.removeLayer(grp); } }),
-        el('span', {}, [name]),
-      ]);
+      const input = el('input', { type: 'checkbox', checked: on ? 'checked' : null, onchange: (ev) => { if (App._review.locked) { ev.target.checked = !ev.target.checked; toast('Layer dikunci.', 'warning'); return; } if (ev.target.checked) map.addLayer(grp); else map.removeLayer(grp); } });
+      App._reviewLayerInputs.push(input);
+      const cb = el('label', { style: 'display:inline-flex;align-items:center;gap:6px;font-size:12px;cursor:pointer;' }, [input, el('span', {}, [name])]);
       layerBar.appendChild(cb);
     });
 
@@ -2801,7 +2940,7 @@
     toast('Jalur & BOQ diperbarui dari ODP/ODC terkini.', 'success');
   }
 
-  async function saveReview() {
+  async function saveReview(silent) {
     const R = App._review; if (!R) return;
     // Bangun objek "gen" baru (generation_id baru → append-only) dari state review.
     const gen = {
@@ -2812,8 +2951,12 @@
       odps: R.odps, odcs: R.odcs, backbone: R.backbone, distribution: R.distribution, poles: R.poles, boq: R.boq,
     };
     const gid = await saveGenerationToDb(R.analysisId, R.projectId, gen, 'draft');
-    if (gid) { App._lastGeneration = { analysisId: R.analysisId, projectId: R.projectId, gen: Object.assign(gen, { _roadsFC: R.roadsFC }), savedId: gid }; toast('Revisi tersimpan (versi baru).', 'success'); }
-    else toast('Revisi belum tersimpan (migration 006?).', 'warning', 4500);
+    if (gid) {
+      App._lastGeneration = { analysisId: R.analysisId, projectId: R.projectId, gen: Object.assign(gen, { _roadsFC: R.roadsFC }), savedId: gid };
+      if (!silent) toast('Revisi tersimpan (versi baru).', 'success');
+    } else if (!silent) {
+      toast('Revisi belum tersimpan (migration 006?).', 'warning', 4500);
+    }
   }
 
   /* ================= [MODULES] PLACEHOLDER FASE BERIKUTNYA ================= */
@@ -2859,6 +3002,12 @@
       odps: gen.odps, odcs: gen.odcs,
       backbone: gen.backbone, distribution: gen.distribution, poles: gen.poles, boq: gen.boq,
       buildingsFC: gen.buildingsFC, homePassedFC: gen.homePassedFC,
+      // REVISION 03: data tambahan (additive, aman diabaikan pembaca lama)
+      // supaya PlanningFinal.computeValidation bisa menjalankan seluruh
+      // 11 pemeriksaan otomatis (drop cable, jalan, boundary).
+      drop: gen.drop,
+      roadsFC: gen._roadsFC || (App._lastGeneration && App._lastGeneration.gen && App._lastGeneration.gen._roadsFC) || null,
+      boundaryFeature: (App._lastAnalysis && App._lastAnalysis.result && App._lastAnalysis.result.boundary && App._lastAnalysis.result.boundary.feature) || null,
     };
   }
 
@@ -2912,6 +3061,14 @@
     await logHistory({ project_id: version.project_id, version_id: version.id, entity: 'approval', action, description: action + ': ' + from + ' → ' + toStatus + (note ? (' — ' + note) : '') });
     version.status = toStatus;
     toast('Status: ' + toStatus, 'success');
+    // REVISION 04: begitu status jadi 'approved', otomatis siapkan paket
+    // Proposal/BOQ Final/Material List (dokumen aktual dibuat on-demand saat
+    // diunduh di halaman Planning Proposal — di sini cukup catat & arahkan
+    // planner, supaya tidak menyimpan file besar berulang di DB).
+    if (toStatus === 'approved') {
+      try { await App.supabase.from('planning_report').insert({ version_id: version.id, project_id: version.project_id, report_type: 'proposal_package', title: 'Auto-generate saat Approve', format: 'ready', created_by: uid() }); } catch (_) {}
+      toast('Proposal & BOQ Final siap dibuat. Buka menu Planning Proposal.', 'info', 5000);
+    }
   }
 
   async function saveValidation(version, snap) {
@@ -2953,6 +3110,26 @@
         el('td', {}, [el('div', { style: 'display:flex;gap:6px;' }, [
           el('button', { class: 'btn btn-ghost btn-sm', title: 'Validasi/Approval', onclick: () => { location.hash = '#/planning-validation?version=' + v.id; } }, [el('i', { class: 'fa-solid fa-clipboard-check' })]),
           el('button', { class: 'btn btn-ghost btn-sm', title: 'Reports', onclick: () => { location.hash = '#/planning-reports?version=' + v.id; } }, [el('i', { class: 'fa-solid fa-file-lines' })]),
+          el('button', { class: 'btn btn-ghost btn-sm', title: 'Restore — buat versi baru dari snapshot ini', onclick: async () => {
+            if (!confirm('Restore "' + (v.version_label || ('V' + v.version_no)) + '"? Ini akan membuat VERSI BARU dari snapshot tsb (versi lama tetap ada, tidak ditimpa).')) return;
+            const snap = v.snapshot || {};
+            let vno = 1;
+            try { const { count } = await App.supabase.from('planning_version').select('*', { count: 'exact', head: true }).eq('analysis_id', analysisId); vno = (count || 0) + 1; } catch (e) {}
+            const row = { project_id: v.project_id, analysis_id: v.analysis_id, generation_id: v.generation_id,
+              version_no: vno, version_label: 'Restore dari ' + (v.version_label || ('V' + v.version_no)), status: 'draft',
+              home_count: v.home_count, building_count: v.building_count, home_passed: v.home_passed,
+              odp_count: v.odp_count, odc_count: v.odc_count, pole_count: v.pole_count,
+              backbone_length_m: v.backbone_length_m, distribution_length_m: v.distribution_length_m,
+              closure_count: v.closure_count, handhole_count: v.handhole_count, jointbox_count: v.jointbox_count,
+              connector_count: v.connector_count, coverage_percent: v.coverage_percent, snapshot: snap, created_by: uid() };
+            try {
+              const { data, error } = await App.supabase.from('planning_version').insert(row).select().single();
+              if (error) throw error;
+              await logHistory({ project_id: v.project_id, version_id: data.id, entity: 'version', action: 'restore', description: 'Restore dari ' + (v.version_label || ('V' + v.version_no)) });
+              toast('Berhasil di-restore sebagai versi baru.', 'success');
+              location.hash = '#/planning-versions?analysis=' + analysisId;
+            } catch (err) { toast('Gagal restore.', 'error'); }
+          } }, [el('i', { class: 'fa-solid fa-clock-rotate-left' })]),
         ])]),
       ]))),
     ]);
@@ -3020,6 +3197,54 @@
     ]);
     container.appendChild(card);
 
+    // ---- REVISION 03: Quality Score ----
+    if (val.quality_score) {
+      const qs = val.quality_score;
+      const gradeColor = { A: '#1E7B4D', B: '#0B6E99', C: '#9A6700', D: '#B3261E' }[qs.grade] || '#5B6774';
+      const scoreRow = (label, value) => el('div', { style: 'flex:1;min-width:110px;text-align:center;padding:10px;' }, [
+        el('div', { style: 'font-size:20px;font-weight:700;' }, [String(value)]),
+        el('div', { class: 'text-xs text-muted' }, [label]),
+      ]);
+      container.appendChild(el('div', { class: 'card' }, [
+        el('div', { class: 'card-header' }, [
+          el('h3', {}, ['Quality Score']),
+          el('span', { class: 'badge', style: 'background:' + gradeColor + '22;color:' + gradeColor + ';font-size:16px;font-weight:800;' }, ['Grade ' + qs.grade]),
+        ]),
+        el('div', { style: 'display:flex;flex-wrap:wrap;border-top:1px solid var(--color-border);' }, [
+          scoreRow('Coverage', qs.coverage), scoreRow('Network', qs.network), scoreRow('Construction', qs.construction),
+          scoreRow('Efficiency', qs.efficiency), scoreRow('Planning', qs.planning),
+          el('div', { style: 'flex:1;min-width:110px;text-align:center;padding:10px;background:var(--color-bg);border-radius:var(--radius-sm);' }, [
+            el('div', { style: 'font-size:22px;font-weight:800;color:' + gradeColor + ';' }, [String(qs.total)]),
+            el('div', { class: 'text-xs text-muted' }, ['Total Score']),
+          ]),
+        ]),
+      ]));
+    }
+
+    // ---- REVISION 03: AI Recommendation (rule-based, lihat val.engine_note) ----
+    if (val.recommendations && val.recommendations.length) {
+      container.appendChild(el('div', { class: 'card' }, [
+        el('div', { class: 'card-header' }, [el('h3', {}, ['AI Recommendation']), el('span', { class: 'badge badge-info', title: val.engine_note }, ['rule-based'])]),
+        el('p', { class: 'text-xs text-muted' }, [val.engine_note]),
+        el('ul', {}, val.recommendations.map((r) => el('li', { style: 'margin-bottom:6px;' }, [r]))),
+      ]));
+    }
+
+    // ---- REVISION 03: rincian isu per aturan (kode + severity + referensi) ----
+    if (val.issues_detail && val.issues_detail.length) {
+      const sevBadge = (s) => el('span', { class: 'badge badge-' + (s === 'error' ? 'danger' : (s === 'warning' ? 'warning' : 'info')) }, [s]);
+      container.appendChild(el('div', { class: 'card' }, [
+        el('div', { class: 'card-header' }, [el('h3', {}, ['Detail Validasi Otomatis (' + val.issues_detail.length + ' isu)'])]),
+        el('div', { class: 'table-wrap' }, [el('table', { class: 'data-table' }, [
+          el('thead', {}, [el('tr', {}, ['Tingkat', 'Aturan', 'Keterangan', 'Referensi'].map((h) => el('th', {}, [h])))]),
+          el('tbody', {}, val.issues_detail.map((iss) => el('tr', {}, [
+            el('td', {}, [sevBadge(iss.severity)]), el('td', { class: 'text-xs' }, [iss.code]),
+            el('td', {}, [iss.message]), el('td', { class: 'text-xs text-muted' }, [iss.ref_id || '-']),
+          ]))),
+        ])]),
+      ]));
+    }
+
     // Workflow actions (role-aware).
     const actions = el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;' });
     const st = version.status;
@@ -3053,6 +3278,7 @@
 
   // ---------- MODULE: PLANNING REPORTS + EXPORT ----------
   ROUTE_TITLES['planning-reports'] = 'Planning Reports';
+  ROUTE_TITLES['planning-proposal'] = 'Proposal & BOQ Final';
   registerModule('planning-reports', async function renderReports(container) {
     container.innerHTML = ''; $('#page-toolbar').innerHTML = '';
     const qs = new URLSearchParams((location.hash.split('?')[1]) || '');
@@ -3074,7 +3300,7 @@
       el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { PF.downloadBlob(fname + '.xls', 'application/vnd.ms-excel', PF.reportsToXLS(reports)); saveReportRecord(version, 'all', 'xls'); } }, [el('i', { class: 'fa-solid fa-file-excel' }), ' Excel']),
       el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { PF.downloadBlob(fname + '.geojson', 'application/geo+json', PF.snapshotToGeoJSON(snap)); saveReportRecord(version, 'geometry', 'geojson'); } }, [el('i', { class: 'fa-solid fa-map' }), ' GeoJSON']),
       el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { PF.downloadBlob(fname + '.kml', 'application/vnd.google-earth.kml+xml', PF.snapshotToKML(snap, fname)); saveReportRecord(version, 'geometry', 'kml'); } }, [el('i', { class: 'fa-solid fa-earth-asia' }), ' KML']),
-      el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { PF.downloadBlob(fname + '.kmz', 'application/vnd.google-earth.kmz', PF.snapshotToKMZ(snap, fname)); saveReportRecord(version, 'geometry', 'kmz'); } }, [el('i', { class: 'fa-solid fa-earth-asia' }), ' KMZ']),
+      el('button', { class: 'btn btn-secondary btn-sm', onclick: async () => { const blob = await PF.snapshotToKMZ(snap, fname); PF.downloadBlob(fname + '.kmz', 'application/vnd.google-earth.kmz', blob); saveReportRecord(version, 'geometry', 'kmz'); } }, [el('i', { class: 'fa-solid fa-earth-asia' }), ' KMZ']),
       el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { const csv = Object.keys(reports).map((k) => '# ' + reports[k].title + '\n' + PF.reportToCSV(reports[k])).join('\n\n'); PF.downloadBlob(fname + '.csv', 'text/csv', csv); saveReportRecord(version, 'all', 'csv'); } }, [el('i', { class: 'fa-solid fa-file-csv' }), ' CSV']),
     ]);
     container.appendChild(el('div', { class: 'card' }, [
@@ -3102,6 +3328,93 @@
     await logHistory({ project_id: version.project_id, version_id: version.id, entity: 'report', action: 'export', description: 'Export ' + format.toUpperCase() });
   }
 
+  // ---------- REVISION 04: PROPOSAL & BOQ FINAL ENGINE ----------
+  // Halaman ini muncul begitu Planner menekan Approve (lihat transitionStatus),
+  // tapi juga bisa dibuka kapan pun untuk versi mana pun / draft yang belum
+  // diversi. Dokumen (Proposal/BOQ Final/Material List) dibuat on-demand saat
+  // tombol export ditekan — tidak disimpan sebagai file besar di DB.
+  registerModule('planning-proposal', async function renderProposal(container) {
+    container.innerHTML = ''; $('#page-toolbar').innerHTML = '';
+    const qs = new URLSearchParams((location.hash.split('?')[1]) || '');
+    const versionId = qs.get('version');
+    let version = versionId ? await loadVersionById(versionId) : null;
+    let snap, ctxProject = null;
+    if (version) { snap = version.snapshot || {}; }
+    else if (App._lastGeneration && App._lastGeneration.gen) { snap = genSnapshot(App._lastGeneration.gen); version = { version_no: 0, version_label: 'Draft (belum diversi)', status: 'draft' }; }
+
+    if (!snap) { container.appendChild(el('div', { class: 'card empty-state' }, [el('i', { class: 'fa-solid fa-file-contract' }), el('h3', {}, ['Belum ada data untuk Proposal']), el('button', { class: 'btn btn-primary btn-sm', onclick: () => { location.hash = '#/planning-wizard?step=3'; } }, ['Ke Generate'])])); return; }
+
+    const PF = window.PlanningFinal;
+    const fname = 'proposal_' + (version.version_label || 'draft').replace(/\s+/g, '_');
+    const proposal = PF.buildProposal({ snapshot: snap, version, project: ctxProject, planner: pname(), boundary: snap.boundaryFeature && snap.boundaryFeature.properties, note: null });
+    const boqFinal = PF.buildBOQFinal(snap);
+    const material = PF.buildMaterialList(snap);
+
+    container.appendChild(el('div', { class: 'card' }, [
+      el('div', { class: 'card-header' }, [el('h3', {}, ['Proposal — ' + (version.version_label || '')]), statusBadge(version.status)]),
+      el('p', { class: 'text-muted text-xs' }, ['Dokumen ini otomatis dihasilkan dari hasil Auto Network Planning yang sudah di-approve. Lengkapi "Catatan Planner" sebelum export bila perlu (lewat halaman Planning Validation/Versions).']),
+      el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;' }, [
+        el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { PF.openPrintable(proposal.html, 'Proposal — ' + proposal.project); } }, [el('i', { class: 'fa-solid fa-file-pdf' }), ' Proposal PDF']),
+        el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { PF.downloadBlob(fname + '_boq_final.xls', 'application/vnd.ms-excel', PF.reportsToXLS({ boq: { title: 'BOQ Final', columns: ['Item', 'Unit', 'Qty'], rows: (boqFinal.items || []).map((it) => [it.item, it.unit, it.quantity]) } })); saveReportRecord(version, 'boq_final', 'xls'); } }, [el('i', { class: 'fa-solid fa-file-excel' }), ' BOQ Final Excel']),
+        el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { PF.downloadBlob(fname + '_material.xls', 'application/vnd.ms-excel', PF.reportsToXLS({ material })); saveReportRecord(version, 'material_list', 'xls'); } }, [el('i', { class: 'fa-solid fa-boxes-stacked' }), ' Material List Excel']),
+        el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { PF.downloadBlob(fname + '.geojson', 'application/geo+json', PF.snapshotToGeoJSON(snap)); saveReportRecord(version, 'geometry', 'geojson'); } }, [el('i', { class: 'fa-solid fa-map' }), ' GeoJSON']),
+        el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { PF.downloadBlob(fname + '.kml', 'application/vnd.google-earth.kml+xml', PF.snapshotToKML(snap, fname)); saveReportRecord(version, 'geometry', 'kml'); } }, [el('i', { class: 'fa-solid fa-earth-asia' }), ' KML']),
+        el('button', { class: 'btn btn-secondary btn-sm', onclick: async () => { const blob = await PF.snapshotToKMZ(snap, fname); PF.downloadBlob(fname + '.kmz', 'application/vnd.google-earth.kmz', blob); saveReportRecord(version, 'geometry', 'kmz'); } }, [el('i', { class: 'fa-solid fa-earth-asia' }), ' KMZ']),
+      ]),
+      el('div', { class: 'text-xs', style: 'color:var(--color-text-muted);' }, ['Feeder: ' + boqFinal.feeder_note]),
+    ]));
+
+    // Preview ringkas Proposal.
+    container.appendChild(el('div', { class: 'card' }, [
+      el('div', { class: 'card-header' }, [el('h3', {}, ['Ringkasan Proposal'])]),
+      el('div', { html: proposal.html }),
+    ]));
+
+    // Material List.
+    container.appendChild(el('div', { class: 'card' }, [
+      el('div', { class: 'card-header' }, [el('h3', {}, ['Material List'])]),
+      el('div', { class: 'table-wrap' }, [el('table', { class: 'data-table' }, [
+        el('thead', {}, [el('tr', {}, material.columns.map((c) => el('th', {}, [c])))]),
+        el('tbody', {}, material.rows.map((r) => el('tr', {}, r.map((c) => el('td', {}, [String(c)]))))),
+      ])]),
+    ]));
+
+    // Map Export (PNG/JPEG/PDF) — pakai peta Review/Summary yang terakhir aktif di sesi ini.
+    const mapCard = el('div', { class: 'card' }, [
+      el('div', { class: 'card-header' }, [el('h3', {}, ['Map Export'])]),
+      el('p', { class: 'text-xs text-muted' }, ['Mengekspor tampilan peta yang terakhir dibuka (Review Mode / Planning Summary) sebagai gambar/PDF.']),
+    ]);
+    const mapBtns = el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;' });
+    ['png', 'jpeg', 'pdf'].forEach((fmt) => {
+      mapBtns.appendChild(el('button', { class: 'btn btn-secondary btn-sm', onclick: () => exportActiveMap(fmt, fname) }, [el('i', { class: 'fa-solid fa-image' }), ' ' + fmt.toUpperCase()]));
+    });
+    mapCard.appendChild(mapBtns);
+    container.appendChild(mapCard);
+  });
+
+  // Cari elemen DOM peta Leaflet yang sedang aktif (Review Mode / Summary / Reports),
+  // lalu render ke canvas (html2canvas) dan unduh sebagai PNG/JPEG/PDF.
+  async function exportActiveMap(format, fname) {
+    const mapInstance = App.reviewMap || App.summaryMap || null;
+    const target = mapInstance ? mapInstance.getContainer() : document.querySelector('.leaflet-container');
+    if (!target || !window.html2canvas) { toast('Peta aktif tidak ditemukan atau html2canvas belum termuat.', 'warning'); return; }
+    try {
+      const canvas = await html2canvas(target, { useCORS: true, allowTaint: true });
+      if (format === 'png' || format === 'jpeg') {
+        const mime = format === 'png' ? 'image/png' : 'image/jpeg';
+        canvas.toBlob((blob) => { window.PlanningFinal.downloadBlob(fname + '_map.' + format, mime, blob); }, mime, 0.95);
+      } else if (format === 'pdf' && window.jspdf) {
+        const { jsPDF } = window.jspdf;
+        const img = canvas.toDataURL('image/png');
+        const pdf = new jsPDF({ orientation: canvas.width > canvas.height ? 'landscape' : 'portrait', unit: 'px', format: [canvas.width, canvas.height] });
+        pdf.addImage(img, 'PNG', 0, 0, canvas.width, canvas.height);
+        pdf.save(fname + '_map.pdf');
+      } else {
+        toast('jsPDF belum termuat untuk export PDF.', 'warning');
+      }
+    } catch (e) { console.error(e); toast('Gagal export peta: ' + e.message, 'error'); }
+  }
+
   // ---------- OVERRIDE MODULE: EXPORT (hub) ----------
   registerModule('export', async function renderExport(container) {
     container.innerHTML = ''; $('#page-toolbar').innerHTML = '';
@@ -3116,7 +3429,7 @@
       card.appendChild(el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;' }, [
         el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { PF.downloadBlob(fname + '.geojson', 'application/geo+json', PF.snapshotToGeoJSON(snap)); } }, ['GeoJSON']),
         el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { PF.downloadBlob(fname + '.kml', 'application/vnd.google-earth.kml+xml', PF.snapshotToKML(snap, fname)); } }, ['KML']),
-        el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { PF.downloadBlob(fname + '.kmz', 'application/vnd.google-earth.kmz', PF.snapshotToKMZ(snap, fname)); } }, ['KMZ']),
+        el('button', { class: 'btn btn-secondary btn-sm', onclick: async () => { const blob = await PF.snapshotToKMZ(snap, fname); PF.downloadBlob(fname + '.kmz', 'application/vnd.google-earth.kmz', blob); } }, ['KMZ']),
         el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { PF.downloadBlob(fname + '.csv', 'text/csv', PF.reportToCSV(PF.buildReports({ snapshot: snap }).boq)); } }, ['CSV BOQ']),
         el('button', { class: 'btn btn-primary btn-sm', onclick: () => { location.hash = '#/planning-reports'; } }, ['Report Lengkap →']),
       ]));
@@ -3174,10 +3487,643 @@
   }
   App.injectPlanningDashboard = injectPlanningDashboard;
 
+  /* ================= [REVISION 01] DETECTED BUILDINGS ================= */
+  ROUTE_TITLES['detected-buildings'] = 'Detected Buildings';
+  const DB_CATEGORIES = ['Rumah', 'Ruko', 'Gedung', 'Apartemen', 'Lainnya'];
+  const DB_STATUSES = ['detected', 'verified', 'edited', 'merged', 'removed'];
+
+  function googleMapsUrl(lat, lng) { return 'https://www.google.com/maps/search/?api=1&query=' + lat + ',' + lng; }
+
+  async function loadDetectedBuildings(filter) {
+    filter = filter || {};
+    try {
+      let q = App.supabase.from('detected_buildings').select('*');
+      if (filter.analysisId) q = q.eq('analysis_id', filter.analysisId);
+      if (filter.projectId) q = q.eq('project_id', filter.projectId);
+      const { data, error } = await q.order('building_id', { ascending: true }).limit(5000);
+      if (error) throw error;
+      return data || [];
+    } catch (e) { console.warn('[DetectedBuildings] load', e.message); return null; }
+  }
+  async function latestAnalysisId() {
+    if (App._lastAnalysis && App._lastAnalysis.id) return App._lastAnalysis.id;
+    try { const { data } = await App.supabase.from('planning_analysis').select('id').order('created_at', { ascending: false }).limit(1); return (data && data[0] && data[0].id) || null; }
+    catch (e) { return null; }
+  }
+
+  // Export helpers untuk daftar bangunan.
+  function buildingsRowsCSV(rows) {
+    const cols = ['building_id', 'lat', 'lng', 'centroid_lat', 'centroid_lng', 'area_sqm', 'perimeter_m', 'category', 'confidence', 'status', 'planner', 'created_at'];
+    const esc = (v) => { v = String(v == null ? '' : v); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
+    return [cols.join(',')].concat(rows.map((r) => cols.map((c) => esc(r[c])).join(','))).join('\r\n');
+  }
+  function buildingsRowsGeoJSON(rows) {
+    return JSON.stringify({ type: 'FeatureCollection', features: rows.map((r) => (r.geojson && r.geojson.geometry) ? { type: 'Feature', properties: { building_id: r.building_id, category: r.category, status: r.status, confidence: r.confidence, area_sqm: r.area_sqm }, geometry: r.geojson.geometry } : { type: 'Feature', properties: { building_id: r.building_id, category: r.category, status: r.status }, geometry: { type: 'Point', coordinates: [r.lng, r.lat] } }) });
+  }
+  function buildingsRowsKML(rows) {
+    const esc = (s) => String(s == null ? '' : s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]);
+    const pm = rows.map((r) => '<Placemark><name>' + esc(r.building_id) + '</name><description>' + esc(r.category + ' / ' + r.status) + '</description><Point><coordinates>' + r.lng + ',' + r.lat + ',0</coordinates></Point></Placemark>').join('');
+    return '<?xml version="1.0" encoding="UTF-8"?><kml xmlns="http://www.opengis.net/kml/2.2"><Document><name>Detected Buildings</name>' + pm + '</Document></kml>';
+  }
+
+  registerModule('detected-buildings', async function renderDetected(container) {
+    container.innerHTML = ''; $('#page-toolbar').innerHTML = '';
+    const qs = new URLSearchParams((location.hash.split('?')[1]) || '');
+    const analysisId = qs.get('analysis') || await latestAnalysisId();
+
+    const st = { rows: [], analysisId, search: '', category: qs.get('category') || '', status: qs.get('status') || '', sort: 'building_id', page: 1, pageSize: 20, selected: {}, detail: null };
+
+    const header = el('div', { class: 'card' }, [
+      el('div', { class: 'card-header' }, [el('h3', {}, ['Detected Buildings']), el('span', { class: 'badge badge-info', id: 'db-count' }, ['0'])]),
+      el('p', { class: 'text-muted' }, ['Seluruh bangunan hasil analisa (deteksi). Klik baris untuk zoom & highlight, klik bangunan untuk detail. Planner dapat tambah/edit/hapus/pindah/duplikat/merge/split.']),
+    ]);
+    container.appendChild(header);
+
+    if (!analysisId) { container.appendChild(el('div', { class: 'card empty-state' }, [el('i', { class: 'fa-solid fa-buildings' }), el('h3', {}, ['Belum ada analisa']), el('p', { class: 'text-muted' }, ['Jalankan Analisa Area dulu.']), el('button', { class: 'btn btn-primary btn-sm', onclick: () => { location.hash = '#/planning-wizard?step=1'; } }, ['Buka Wizard'])])); return; }
+
+    const rows = await loadDetectedBuildings({ analysisId });
+    if (rows === null) { container.appendChild(el('div', { class: 'card empty-state' }, [el('i', { class: 'fa-solid fa-triangle-exclamation' }), el('h3', {}, ['Tabel belum tersedia']), el('p', { class: 'text-muted' }, ['Jalankan migration 008_detected_buildings.sql lalu analisa ulang.'])])); return; }
+    st.rows = rows;
+
+    // Toolbar.
+    const searchIn = el('input', { class: 'text-input', placeholder: 'Cari Building ID / kategori...', style: 'max-width:220px;', oninput: (e) => { st.search = e.target.value.trim().toLowerCase(); st.page = 1; paint(); } });
+    if (st.search) searchIn.value = st.search;
+    const catSel = el('select', { class: 'text-input', style: 'max-width:150px;', onchange: (e) => { st.category = e.target.value; st.page = 1; paint(); } }, [el('option', { value: '' }, ['Semua kategori'])].concat(DB_CATEGORIES.map((c) => el('option', { value: c, selected: st.category === c ? 'selected' : null }, [c]))));
+    const statSel = el('select', { class: 'text-input', style: 'max-width:150px;', onchange: (e) => { st.status = e.target.value; st.page = 1; paint(); } }, [el('option', { value: '' }, ['Semua status'])].concat(DB_STATUSES.map((s) => el('option', { value: s, selected: st.status === s ? 'selected' : null }, [s]))));
+    const sortSel = el('select', { class: 'text-input', style: 'max-width:160px;', onchange: (e) => { st.sort = e.target.value; paint(); } }, [['building_id', 'Building ID'], ['area_sqm', 'Area'], ['perimeter_m', 'Perimeter'], ['confidence', 'Confidence'], ['category', 'Kategori'], ['status', 'Status']].map((o) => el('option', { value: o[0] }, [o[1]])));
+    const toolbar = el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px;' }, [searchIn, catSel, statSel, el('span', { class: 'text-xs text-muted' }, ['Urut:']), sortSel]);
+
+    const exportBar = el('div', { style: 'display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;' }, [
+      el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { window.PlanningFinal.downloadBlob('detected_buildings.csv', 'text/csv', buildingsRowsCSV(filtered())); } }, [el('i', { class: 'fa-solid fa-file-csv' }), ' CSV']),
+      el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { const rowsF = filtered(); const rep = { title: 'Detected Buildings', columns: ['Building ID', 'Lat', 'Lng', 'Area', 'Perimeter', 'Kategori', 'Confidence', 'Status'], rows: rowsF.map((r) => [r.building_id, r.lat, r.lng, r.area_sqm, r.perimeter_m, r.category, r.confidence, r.status]) }; window.PlanningFinal.downloadBlob('detected_buildings.xls', 'application/vnd.ms-excel', window.PlanningFinal.reportsToXLS({ b: rep })); } }, [el('i', { class: 'fa-solid fa-file-excel' }), ' Excel']),
+      el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { window.PlanningFinal.downloadBlob('detected_buildings.geojson', 'application/geo+json', buildingsRowsGeoJSON(filtered())); } }, [el('i', { class: 'fa-solid fa-map' }), ' GeoJSON']),
+      el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { window.PlanningFinal.downloadBlob('detected_buildings.kml', 'application/vnd.google-earth.kml+xml', buildingsRowsKML(filtered())); } }, [el('i', { class: 'fa-solid fa-earth-asia' }), ' KML']),
+    ]);
+
+    // CRUD toolbar.
+    const crudBar = el('div', { style: 'display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px;' }, [
+      el('button', { class: 'btn btn-primary btn-sm', onclick: addBuilding }, [el('i', { class: 'fa-solid fa-plus' }), ' Tambah']),
+      el('button', { class: 'btn btn-secondary btn-sm', onclick: mergeSelected }, [el('i', { class: 'fa-solid fa-object-group' }), ' Merge terpilih']),
+      el('button', { class: 'btn btn-secondary btn-sm', onclick: splitSelected }, [el('i', { class: 'fa-solid fa-object-ungroup' }), ' Split terpilih']),
+      el('button', { class: 'btn btn-danger btn-sm', onclick: deleteSelected }, [el('i', { class: 'fa-solid fa-trash' }), ' Hapus terpilih']),
+    ]);
+
+    const mapEl = el('div', { id: 'db-map', style: 'height:340px;border-radius:10px;overflow:hidden;margin-bottom:10px;' });
+    const tableWrap = el('div', { class: 'table-wrap' });
+    const pager = el('div', { style: 'display:flex;gap:8px;align-items:center;justify-content:flex-end;margin-top:8px;' });
+    const detailWrap = el('div', { style: 'margin-top:12px;' });
+
+    container.appendChild(el('div', { class: 'card' }, [toolbar, crudBar, exportBar, mapEl, tableWrap, pager]));
+    container.appendChild(detailWrap);
+
+    // Peta.
+    let map = null, layer = null;
+    function ensureMap() {
+      if (map || !window.L) return;
+      map = L.map(mapEl, { zoomControl: true }).setView(CFG.DEFAULT_CENTER, CFG.DEFAULT_ZOOM);
+      App.detectedMap = map;
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '&copy; OpenStreetMap', maxZoom: 20 }).addTo(map);
+      layer = L.layerGroup().addTo(map);
+    }
+    function colorOf(cat) { return { Rumah: '#1E7B4D', Ruko: '#9A6700', Gedung: '#8250DF', Apartemen: '#0B6E99', Lainnya: '#57606A' }[cat] || '#57606A'; }
+
+    function drawMap(pageRows) {
+      ensureMap(); if (!map) return;
+      layer.clearLayers();
+      const pts = [];
+      pageRows.forEach((r) => {
+        let lyr;
+        if (r.polygon && r.polygon.type) {
+          lyr = L.geoJSON({ type: 'Feature', geometry: r.polygon, properties: {} }, { style: { color: colorOf(r.category), weight: 1.5, fillOpacity: 0.25 } });
+          lyr.on('click', () => { st.detail = r; renderDetail(); });
+        } else {
+          // Titik: marker draggable agar planner bisa MOVE (Revision 01, Perubahan 7).
+          const ic = L.divIcon({ className: 'db-pin', html: '<div style="width:12px;height:12px;border-radius:50%;background:' + colorOf(r.category) + ';border:2px solid #fff;box-shadow:0 0 2px rgba(0,0,0,.5);"></div>', iconSize: [12, 12], iconAnchor: [6, 6] });
+          lyr = L.marker([r.lat, r.lng], { icon: ic, draggable: true });
+          lyr.on('click', () => { st.detail = r; renderDetail(); });
+          lyr.on('dragend', async (e) => {
+            const ll = e.target.getLatLng();
+            await updateBuilding(r, { lat: ll.lat, lng: ll.lng, centroid_lat: ll.lat, centroid_lng: ll.lng, status: r.status === 'detected' ? 'edited' : r.status, geojson: { type: 'Feature', geometry: { type: 'Point', coordinates: [ll.lng, ll.lat] }, properties: {} } });
+            toast('Posisi ' + r.building_id + ' dipindah.', 'success');
+          });
+        }
+        lyr.addTo(layer); pts.push([r.lat, r.lng]);
+        r._layer = lyr;
+      });
+      if (pts.length) { try { map.fitBounds(pts, { maxZoom: 18, padding: [20, 20] }); } catch (e) {} }
+      setTimeout(() => { try { map.invalidateSize(); } catch (e) {} }, 150);
+    }
+    function zoomTo(r) { ensureMap(); if (!map) return; map.setView([r.lat, r.lng], 19); if (r._layer && r._layer.openPopup) { /* highlight */ } if (r._layer && r._layer.setStyle) { r._layer.setStyle({ weight: 3, color: '#B3261E' }); } }
+
+    function filtered() {
+      let out = st.rows.slice();
+      if (st.search) out = out.filter((r) => (String(r.building_id || '').toLowerCase().indexOf(st.search) !== -1) || (String(r.category || '').toLowerCase().indexOf(st.search) !== -1));
+      if (st.category) out = out.filter((r) => r.category === st.category);
+      if (st.status) out = out.filter((r) => r.status === st.status);
+      out.sort((a, b) => { const va = a[st.sort], vb = b[st.sort]; if (typeof va === 'number' && typeof vb === 'number') return vb - va; return String(va).localeCompare(String(vb)); });
+      return out;
+    }
+
+    function paint() {
+      const all = filtered();
+      $('#db-count').textContent = fmtNumber(all.length);
+      const pages = Math.max(1, Math.ceil(all.length / st.pageSize));
+      if (st.page > pages) st.page = pages;
+      const start = (st.page - 1) * st.pageSize;
+      const pageRows = all.slice(start, start + st.pageSize);
+
+      tableWrap.innerHTML = '';
+      const table = el('table', { class: 'data-table' }, [
+        el('thead', {}, [el('tr', {}, ['', 'No', 'Building ID', 'Lat', 'Lng', 'Area', 'Perimeter', 'Kategori', 'Confidence', 'Status', 'Planner', 'Tanggal'].map((h) => el('th', {}, [h])))]),
+        el('tbody', {}, pageRows.map((r, i) => {
+          const cb = el('input', { type: 'checkbox', onclick: (e) => { e.stopPropagation(); if (e.target.checked) st.selected[r.id] = true; else delete st.selected[r.id]; } });
+          if (st.selected[r.id]) cb.setAttribute('checked', 'checked');
+          const tr = el('tr', { style: 'cursor:pointer;' }, [
+            el('td', {}, [cb]),
+            el('td', {}, [String(start + i + 1)]),
+            el('td', { style: 'font-weight:600;' }, [r.building_id || '-']),
+            el('td', {}, [String(r.lat != null ? Number(r.lat).toFixed(6) : '-')]),
+            el('td', {}, [String(r.lng != null ? Number(r.lng).toFixed(6) : '-')]),
+            el('td', {}, [fmtNumber(r.area_sqm) + ' m²']),
+            el('td', {}, [fmtNumber(r.perimeter_m) + ' m']),
+            el('td', {}, [el('span', { class: 'badge badge-neutral' }, [r.category || '-'])]),
+            el('td', {}, [String(r.confidence != null ? r.confidence : '-')]),
+            el('td', {}, [el('span', { class: 'badge badge-' + (r.status === 'detected' ? 'info' : (r.status === 'removed' ? 'danger' : 'success')) }, [r.status || '-'])]),
+            el('td', { class: 'text-xs' }, [r.planner || '-']),
+            el('td', { class: 'text-xs text-muted' }, [String(r.created_at || '').slice(0, 10)]),
+          ]);
+          tr.addEventListener('click', () => { st.detail = r; zoomTo(r); renderDetail(); });
+          return tr;
+        })),
+      ]);
+      tableWrap.appendChild(table);
+
+      pager.innerHTML = '';
+      pager.appendChild(el('span', { class: 'text-xs text-muted' }, ['Halaman ' + st.page + ' / ' + pages]));
+      pager.appendChild(el('button', { class: 'btn btn-ghost btn-sm', disabled: st.page <= 1 ? 'disabled' : null, onclick: () => { st.page--; paint(); } }, ['‹ Prev']));
+      pager.appendChild(el('button', { class: 'btn btn-ghost btn-sm', disabled: st.page >= pages ? 'disabled' : null, onclick: () => { st.page++; paint(); } }, ['Next ›']));
+
+      drawMap(pageRows);
+    }
+
+    function renderDetail() {
+      detailWrap.innerHTML = '';
+      const r = st.detail; if (!r) return;
+      const catSelD = el('select', { class: 'text-input', style: 'max-width:160px;' }, DB_CATEGORIES.map((c) => el('option', { value: c, selected: r.category === c ? 'selected' : null }, [c])));
+      const statSelD = el('select', { class: 'text-input', style: 'max-width:160px;' }, DB_STATUSES.map((s) => el('option', { value: s, selected: r.status === s ? 'selected' : null }, [s])));
+      const field = (label, val) => el('div', { style: 'display:flex;justify-content:space-between;gap:12px;padding:4px 0;border-bottom:1px solid #eee;' }, [el('span', { class: 'text-xs text-muted' }, [label]), el('span', { style: 'font-weight:600;word-break:break-all;' }, [String(val)])]);
+      detailWrap.appendChild(el('div', { class: 'card' }, [
+        el('div', { class: 'card-header' }, [el('h3', {}, ['Detail: ' + (r.building_id || '-')]), statusBadge(r.status)]),
+        field('Latitude', r.lat), field('Longitude', r.lng), field('Centroid', (r.centroid_lat != null ? r.centroid_lat : r.lat) + ', ' + (r.centroid_lng != null ? r.centroid_lng : r.lng)),
+        field('Area', fmtNumber(r.area_sqm) + ' m²'), field('Perimeter', fmtNumber(r.perimeter_m) + ' m'),
+        field('Polygon', r.polygon ? 'Ada' : 'Titik'), field('Confidence', r.confidence),
+        el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;margin:8px 0;align-items:center;' }, [el('span', { class: 'text-xs text-muted' }, ['Kategori']), catSelD, el('span', { class: 'text-xs text-muted' }, ['Status']), statSelD]),
+        el('details', {}, [el('summary', { class: 'text-xs text-muted' }, ['GeoJSON']), el('pre', { style: 'max-height:120px;overflow:auto;font-size:11px;background:#f6f8fa;padding:8px;border-radius:6px;' }, [JSON.stringify(r.geojson || { type: 'Point', coordinates: [r.lng, r.lat] })])]),
+        el('div', { style: 'display:flex;gap:6px;flex-wrap:wrap;margin-top:8px;' }, [
+          el('button', { class: 'btn btn-primary btn-sm', onclick: async () => { await updateBuilding(r, { category: catSelD.value, status: statSelD.value === 'detected' ? 'edited' : statSelD.value }); } }, [el('i', { class: 'fa-solid fa-floppy-disk' }), ' Simpan']),
+          el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { const ll = (r.lat) + ',' + (r.lng); if (navigator.clipboard) navigator.clipboard.writeText(ll); toast('Koordinat disalin: ' + ll, 'success'); } }, [el('i', { class: 'fa-solid fa-copy' }), ' Copy Coordinate']),
+          el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { window.open(googleMapsUrl(r.lat, r.lng), '_blank'); } }, [el('i', { class: 'fa-solid fa-map-location-dot' }), ' Google Maps']),
+          el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { zoomTo(r); } }, [el('i', { class: 'fa-solid fa-magnifying-glass-plus' }), ' Zoom']),
+          el('button', { class: 'btn btn-secondary btn-sm', onclick: () => duplicateBuilding(r) }, [el('i', { class: 'fa-solid fa-clone' }), ' Duplicate']),
+          el('button', { class: 'btn btn-secondary btn-sm', onclick: () => splitBuilding(r) }, [el('i', { class: 'fa-solid fa-object-ungroup' }), ' Split']),
+          el('button', { class: 'btn btn-danger btn-sm', onclick: () => deleteBuilding(r) }, [el('i', { class: 'fa-solid fa-trash' }), ' Hapus']),
+        ]),
+      ]));
+    }
+
+    // ---- CRUD ----
+    async function afterChange(msg) { toast(msg + ' — Dashboard/Planning/BOQ akan mengikuti saat regenerate.', 'success', 3500); const fresh = await loadDetectedBuildings({ analysisId: st.analysisId }); if (fresh) { st.rows = fresh; st.selected = {}; paint(); if (st.detail) { st.detail = fresh.find((x) => x.id === st.detail.id) || null; renderDetail(); } } }
+    function nextBid() { return 'BLD-' + String(Date.now()).slice(-6); }
+    async function insertRow(row) {
+      try { const { data, error } = await App.supabase.from('detected_buildings').insert(Object.assign({ analysis_id: st.analysisId, project_id: (App._lastAnalysis && App._lastAnalysis.projectId) || null, planner: pname(), created_by: uid() }, row)).select().single(); if (error) throw error; return data; }
+      catch (e) { toast('Gagal simpan (migration 008?).', 'warning', 4000); return null; }
+    }
+    async function addBuilding() {
+      ensureMap(); const c = map ? map.getCenter() : { lat: CFG.DEFAULT_CENTER[0], lng: CFG.DEFAULT_CENTER[1] };
+      const row = { building_id: nextBid(), lat: c.lat, lng: c.lng, centroid_lat: c.lat, centroid_lng: c.lng, polygon: null, geojson: { type: 'Feature', geometry: { type: 'Point', coordinates: [c.lng, c.lat] }, properties: {} }, area_sqm: 60, perimeter_m: 31, category: 'Rumah', confidence: 1, status: 'edited' };
+      const d = await insertRow(row); if (d) afterChange('Bangunan ditambahkan');
+    }
+    async function updateBuilding(r, patch) {
+      try { const { error } = await App.supabase.from('detected_buildings').update(patch).eq('id', r.id); if (error) throw error; afterChange('Perubahan disimpan'); }
+      catch (e) { toast('Gagal update.', 'warning'); }
+    }
+    async function deleteBuilding(r) {
+      if (!confirm('Hapus ' + r.building_id + '?')) return;
+      try { await App.supabase.from('detected_buildings').delete().eq('id', r.id); st.detail = null; afterChange('Bangunan dihapus'); }
+      catch (e) { toast('Gagal hapus.', 'warning'); }
+    }
+    async function duplicateBuilding(r) {
+      const row = Object.assign({}, r); delete row.id; delete row.created_at; delete row.updated_at;
+      row.building_id = nextBid(); row.lat = Number(r.lat) + 0.00008; row.lng = Number(r.lng) + 0.00008; row.centroid_lat = row.lat; row.centroid_lng = row.lng; row.status = 'edited'; row.polygon = null;
+      row.geojson = { type: 'Feature', geometry: { type: 'Point', coordinates: [row.lng, row.lat] }, properties: {} };
+      const d = await insertRow(row); if (d) afterChange('Bangunan diduplikat');
+    }
+    async function splitBuilding(r) {
+      const a = { building_id: nextBid(), lat: Number(r.lat) + 0.00006, lng: Number(r.lng), centroid_lat: Number(r.lat) + 0.00006, centroid_lng: Number(r.lng), area_sqm: Math.round((r.area_sqm || 60) / 2), perimeter_m: r.perimeter_m, category: r.category, confidence: r.confidence, status: 'edited', polygon: null, geojson: { type: 'Feature', geometry: { type: 'Point', coordinates: [Number(r.lng), Number(r.lat) + 0.00006] }, properties: {} } };
+      const b = Object.assign({}, a, { building_id: nextBid(), lat: Number(r.lat) - 0.00006, centroid_lat: Number(r.lat) - 0.00006, geojson: { type: 'Feature', geometry: { type: 'Point', coordinates: [Number(r.lng), Number(r.lat) - 0.00006] }, properties: {} } });
+      await insertRow(a); await insertRow(b);
+      try { await App.supabase.from('detected_buildings').update({ status: 'merged' }).eq('id', r.id); } catch (e) {}
+      afterChange('Bangunan di-split menjadi 2');
+    }
+    async function deleteSelected() {
+      const ids = Object.keys(st.selected); if (!ids.length) { toast('Pilih baris dulu (checkbox).', 'info'); return; }
+      if (!confirm('Hapus ' + ids.length + ' bangunan terpilih?')) return;
+      try { await App.supabase.from('detected_buildings').delete().in('id', ids); afterChange(ids.length + ' bangunan dihapus'); }
+      catch (e) { toast('Gagal hapus massal.', 'warning'); }
+    }
+    async function mergeSelected() {
+      const ids = Object.keys(st.selected); if (ids.length < 2) { toast('Pilih minimal 2 bangunan.', 'info'); return; }
+      const sel = st.rows.filter((r) => st.selected[r.id]);
+      const lat = sel.reduce((a, r) => a + Number(r.lat), 0) / sel.length;
+      const lng = sel.reduce((a, r) => a + Number(r.lng), 0) / sel.length;
+      const area = sel.reduce((a, r) => a + Number(r.area_sqm || 0), 0);
+      const merged = { building_id: nextBid(), lat, lng, centroid_lat: lat, centroid_lng: lng, area_sqm: area, perimeter_m: Math.round(4 * Math.sqrt(area || 1)), category: sel[0].category, confidence: 1, status: 'merged', polygon: null, geojson: { type: 'Feature', geometry: { type: 'Point', coordinates: [lng, lat] }, properties: {} } };
+      const d = await insertRow(merged);
+      if (d) { try { await App.supabase.from('detected_buildings').delete().in('id', ids); } catch (e) {} afterChange(ids.length + ' bangunan digabung'); }
+    }
+    async function splitSelected() { const ids = Object.keys(st.selected); if (ids.length !== 1) { toast('Pilih tepat 1 bangunan untuk split.', 'info'); return; } const r = st.rows.find((x) => x.id === ids[0]); if (r) splitBuilding(r); }
+
+    paint();
+  }, function destroyDetected() { if (App.detectedMap) { try { App.detectedMap.remove(); } catch (e) {} App.detectedMap = null; } });
+
+  // Kategori bangunan yang dapat diklik di Dashboard (Revision 01, Perubahan 9).
+  async function injectBuildingCategories(container) {
+    let rows = [];
+    try { const { data } = await App.supabase.from('detected_buildings').select('category'); rows = data || []; } catch (e) { return; }
+    if (!rows.length) return;
+    const counts = { Rumah: 0, Ruko: 0, Gedung: 0, Apartemen: 0, Lainnya: 0 };
+    rows.forEach((r) => { counts[r.category] = (counts[r.category] || 0) + 1; });
+    const icon = { Rumah: 'fa-house', Ruko: 'fa-store', Gedung: 'fa-building', Apartemen: 'fa-city', Lainnya: 'fa-shapes' };
+    const grid = el('div', { class: 'stat-grid' }, DB_CATEGORIES.map((c) => {
+      const card = el('div', { class: 'stat-card', style: 'cursor:pointer;', title: 'Lihat daftar ' + c }, [el('div', { class: 'stat-icon' }, [el('i', { class: 'fa-solid ' + icon[c] })]), el('div', {}, [el('div', { class: 'stat-value' }, [fmtNumber(counts[c] || 0)]), el('div', { class: 'stat-label' }, [c])])]);
+      card.addEventListener('click', () => { location.hash = '#/detected-buildings?category=' + encodeURIComponent(c); });
+      return card;
+    }));
+    container.appendChild(el('div', { class: 'card', style: 'margin-top:16px;' }, [el('div', { class: 'card-header' }, [el('h3', {}, ['Bangunan Terdeteksi (klik untuk daftar)'])]), grid]));
+  }
+  App.injectBuildingCategories = injectBuildingCategories;
+
   /* ================= [REALTIME] ================= */
   function stopRealtime() {
     App.realtimeChannels.forEach((ch) => App.supabase.removeChannel(ch));
     App.realtimeChannels = [];
+  }
+
+  /* ================= [REVISION 05] CONSTRUCTION, AS-BUILT & ASSET MANAGEMENT ================= */
+  ROUTE_TITLES['asset-management'] = 'Asset Management';
+  ROUTE_TITLES['global-map'] = 'Global Map';
+  ROUTE_TITLES['asset-reports'] = 'Asset & QC Reports';
+
+  // Aset titik (lat/lng langsung) — didukung PENUH: update lokasi (As Built),
+  // riwayat versi + restore, foto dokumentasi.
+  const ASSET_DEFS = [
+    { type: 'pole', table: 'poles', nameCol: 'code', label: 'Tiang' },
+    { type: 'odp', table: 'odp', nameCol: 'name', label: 'ODP' },
+    { type: 'odc', table: 'odc', nameCol: 'name', label: 'ODC' },
+    { type: 'home', table: 'homes', nameCol: 'owner_name', label: 'Rumah' },
+    { type: 'closure', table: 'closures', nameCol: 'name', label: 'Closure' },
+    { type: 'handhole', table: 'handholes', nameCol: 'name', label: 'Handhole' },
+    { type: 'jointbox', table: 'jointboxes', nameCol: 'name', label: 'Joint Box' },
+  ];
+  // Aset garis (geometry LineString) — status/BOQ/report didukung, TAPI
+  // edit geometri lewat form lat/lng TIDAK relevan (butuh editor garis
+  // tersendiri, di luar cakupan revisi ini — lihat REVISION_05_REPORT.md).
+  const LINE_ASSET_DEFS = [
+    { type: 'backbone', table: 'backbones', nameCol: 'name', label: 'Backbone' },
+    { type: 'distribution', table: 'distributions', nameCol: 'name', label: 'Distribution' },
+    { type: 'drop', table: 'kabels', nameCol: 'name', label: 'Drop Cable / Kabel' },
+  ];
+  function assetDef(type) { return ASSET_DEFS.find((d) => d.type === type) || LINE_ASSET_DEFS.find((d) => d.type === type); }
+
+  // PRODUCTION HARDENING: batasi jumlah baris per tabel per fetch supaya
+  // tidak menggantung/crash di dataset sangat besar (target skala: ratusan
+  // ribu bangunan). Ini BUKAN solusi skala-penuh (virtual scroll/pagination
+  // sungguhan) — lihat FINAL_PERFORMANCE_REPORT.md untuk keterbatasan jujur
+  // & rekomendasi lanjutan bila dataset produksi mendekati 500.000 baris.
+  const ASSET_FETCH_LIMIT = 20000;
+  async function loadAllPointAssets() {
+    const out = []; let truncated = false;
+    await Promise.all(ASSET_DEFS.map(async (def) => {
+      try {
+        const { data, error } = await App.supabase.from(def.table).select('id,' + def.nameCol + ',lat,lng,asset_status,project_id').limit(ASSET_FETCH_LIMIT);
+        if (error || !data) return;
+        if (data.length >= ASSET_FETCH_LIMIT) truncated = true;
+        data.forEach((r) => out.push({ asset_type: def.type, id: r.id, name: r[def.nameCol], lat: r.lat, lng: r.lng, asset_status: r.asset_status || 'draft', project_id: r.project_id }));
+      } catch (e) { /* migration 011 belum jalan / kolom belum ada — abaikan tabel ini */ }
+    }));
+    out._truncated = truncated;
+    return out;
+  }
+  async function loadAllLineAssets() {
+    const out = []; let truncated = false;
+    await Promise.all(LINE_ASSET_DEFS.map(async (def) => {
+      try {
+        const { data, error } = await App.supabase.from(def.table).select('id,' + def.nameCol + ',asset_status,project_id,length_m').limit(ASSET_FETCH_LIMIT);
+        if (error || !data) return;
+        if (data.length >= ASSET_FETCH_LIMIT) truncated = true;
+        data.forEach((r) => out.push({ asset_type: def.type, id: r.id, name: r[def.nameCol], asset_status: r.asset_status || 'draft', project_id: r.project_id, length_m: r.length_m }));
+      } catch (e) {}
+    }));
+    out._truncated = truncated;
+    return out;
+  }
+  async function logAssetChange(entry) {
+    try { await App.supabase.from('asset_change_log').insert(Object.assign({ changed_by: uid(), changed_by_name: pname() }, entry)); }
+    catch (e) { console.warn('[AssetMgmt] gagal mencatat log:', e.message); }
+  }
+  async function loadAssetChangeLog(assetType, assetId) {
+    try { const { data } = await App.supabase.from('asset_change_log').select('*').eq('asset_type', assetType).eq('asset_id', assetId).order('created_at', { ascending: false }); return data || []; }
+    catch (e) { return []; }
+  }
+  async function loadAssetPhotos(assetType, assetId) {
+    try { const { data } = await App.supabase.from('asset_photo').select('*').eq('asset_type', assetType).eq('asset_id', assetId).order('created_at', { ascending: false }); return data || []; }
+    catch (e) { return []; }
+  }
+  async function loadAssetDocuments(assetType, assetId) {
+    try { const { data } = await App.supabase.from('asset_document').select('*').eq('asset_type', assetType).eq('asset_id', assetId).order('created_at', { ascending: false }); return data || []; }
+    catch (e) { return []; }
+  }
+  // Duplicate Asset — menutup celah dari FINAL_AUDIT_REPORT.md. Hanya untuk
+  // aset titik (lat/lng); aset garis butuh duplikasi geometri yang lebih
+  // kompleks dan belum didukung di sini.
+  async function duplicateAsset(asset) {
+    const def = assetDef(asset.asset_type); if (!def) return;
+    if (asset.lat == null) { toast('Duplikasi aset garis belum didukung — duplikasi manual lewat halaman CRUD terkait.', 'warning', 5000); return; }
+    const ok = await confirmDialog('Duplikat "' + (asset.name || asset.id) + '"? Salinan baru akan ditempatkan sedikit bergeser dari lokasi asli.', 'Duplikat Aset');
+    if (!ok) return;
+    const nameCol = def.nameCol;
+    const payload = { lat: asset.lat + 0.00005, lng: asset.lng + 0.00005, asset_status: 'draft' };
+    payload[nameCol] = (asset.name || '') + ' (copy)';
+    if (asset.project_id) payload.project_id = asset.project_id;
+    try {
+      const { data, error } = await App.supabase.from(def.table).insert(payload).select().single();
+      if (error) throw error;
+      await logAssetChange({ project_id: asset.project_id, asset_type: asset.asset_type, asset_id: data.id, change_type: 'field_update', new_value: { duplicated_from: asset.id }, note: 'Hasil duplikasi dari ' + (asset.name || asset.id) });
+      toast(def.label + ' berhasil diduplikasi.', 'success');
+    } catch (e) { toast('Gagal duplikasi: ' + e.message, 'error'); }
+  }
+  async function updateAssetStatus(asset, newStatus) {
+    const def = assetDef(asset.asset_type); if (!def) return;
+    const old = asset.asset_status;
+    try { await App.supabase.from(def.table).update({ asset_status: newStatus }).eq('id', asset.id); }
+    catch (e) { toast('Gagal update status (pastikan Migration 011 sudah dijalankan).', 'error'); return; }
+    await logAssetChange({ project_id: asset.project_id, asset_type: asset.asset_type, asset_id: asset.id, change_type: 'status_change', old_value: { asset_status: old }, new_value: { asset_status: newStatus } });
+    asset.asset_status = newStatus;
+    toast('Status aset diperbarui.', 'success');
+  }
+  async function updateAssetLocation(asset, newLat, newLng, note, reason, changeType) {
+    const def = assetDef(asset.asset_type); if (!def) return false;
+    const oldLat = asset.lat, oldLng = asset.lng;
+    try { await App.supabase.from(def.table).update({ lat: newLat, lng: newLng }).eq('id', asset.id); }
+    catch (e) { toast('Gagal update lokasi.', 'error'); return false; }
+    await logAssetChange({ project_id: asset.project_id, asset_type: asset.asset_type, asset_id: asset.id, change_type: changeType || 'move', old_lat: oldLat, old_lng: oldLng, new_lat: newLat, new_lng: newLng, note: note || null, reason: reason || null });
+    asset.lat = newLat; asset.lng = newLng;
+    toast('Lokasi diperbarui & tercatat sebagai As Built.', 'success');
+    return true;
+  }
+
+  registerModule('asset-management', async function renderAssetManagement(container) {
+    container.innerHTML = ''; $('#page-toolbar').innerHTML = '';
+    const [points, lines] = await Promise.all([loadAllPointAssets(), loadAllLineAssets()]);
+    const all = points.concat(lines);
+    if (points._truncated || lines._truncated) toast('Sebagian tabel aset melebihi ' + ASSET_FETCH_LIMIT + ' baris — data yang ditampilkan dibatasi demi performa.', 'warning', 6000);
+    if (!all.length) {
+      container.appendChild(el('div', { class: 'card empty-state' }, [el('i', { class: 'fa-solid fa-toolbox' }), el('h3', {}, ['Belum ada aset atau Migration 011 belum dijalankan.']), el('p', { class: 'text-muted text-xs' }, ['Jalankan schema_full.sql (bagian [J] MIGRATION 011) di Supabase, lalu buat data aset lewat modul Mapping/Import.'])]));
+      return;
+    }
+    const state = { q: '', type: '', status: '', selected: null };
+    const filterCard = el('div', { class: 'card' }, [
+      el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;align-items:center;' }, [
+        el('input', { type: 'text', placeholder: 'Cari nama/kode/lat/lng/project...', class: 'text-input', style: 'flex:1;min-width:180px;', oninput: (e) => { state.q = e.target.value; renderList(); } }),
+        el('select', { class: 'text-input', style: 'width:auto;', onchange: (e) => { state.type = e.target.value; renderList(); } }, [el('option', { value: '' }, ['Semua Jenis'])].concat(ASSET_DEFS.concat(LINE_ASSET_DEFS).map((d) => el('option', { value: d.type }, [d.label])))),
+        el('select', { class: 'text-input', style: 'width:auto;', onchange: (e) => { state.status = e.target.value; renderList(); } }, [el('option', { value: '' }, ['Semua Status'])].concat(window.PlanningFinal.ASSET_STATUS_ORDER.map((s) => el('option', { value: s }, [s])))),
+      ]),
+    ]);
+    const listCard = el('div', { class: 'card' });
+    const detailCard = el('div', { id: 'asset-detail-card' });
+    container.appendChild(filterCard); container.appendChild(listCard); container.appendChild(detailCard);
+
+    function renderList() {
+      listCard.innerHTML = '';
+      const filtered = all.filter((a) => {
+        if (state.type && a.asset_type !== state.type) return false;
+        if (state.status && a.asset_status !== state.status) return false;
+        if (state.q) { const q = state.q.toLowerCase(); const hay = [a.name, a.asset_type, a.lat, a.lng, a.project_id].join(' ').toLowerCase(); if (!hay.includes(q)) return false; }
+        return true;
+      });
+      listCard.appendChild(el('div', { class: 'card-header' }, [el('h3', {}, ['Daftar Aset (' + filtered.length + ' dari ' + all.length + ')'])]));
+      listCard.appendChild(el('div', { class: 'table-wrap' }, [el('table', { class: 'data-table' }, [
+        el('thead', {}, [el('tr', {}, ['Jenis', 'Nama/Kode', 'Lat,Lng', 'Status', 'Aksi'].map((h) => el('th', {}, [h])))]),
+        el('tbody', {}, filtered.slice(0, 300).map((a) => el('tr', {}, [
+          el('td', {}, [assetDef(a.asset_type).label]),
+          el('td', {}, [a.name || '-']),
+          el('td', { class: 'text-xs' }, [a.lat != null ? (round1(a.lat) + ', ' + round1(a.lng)) : (a.length_m ? (Math.round(a.length_m) + ' m') : '-')]),
+          el('td', {}, [(() => { const sel = el('select', { class: 'text-input', onchange: (e) => updateAssetStatus(a, e.target.value).then(renderList) }, window.PlanningFinal.ASSET_STATUS_ORDER.map((s) => el('option', { value: s }, [s]))); sel.value = a.asset_status; return sel; })()]),
+          el('td', {}, [
+            el('button', { class: 'btn btn-ghost btn-sm', onclick: () => { state.selected = a; renderDetail(); } }, [el('i', { class: 'fa-solid fa-eye' }), ' Detail']),
+            el('button', { class: 'btn btn-ghost btn-sm', title: 'Duplikat aset ini', onclick: () => duplicateAsset(a).then(renderList) }, [el('i', { class: 'fa-solid fa-clone' })]),
+          ]),
+        ]))),
+      ])]));
+    }
+    function round1(n) { return Math.round((n || 0) * 100000) / 100000; }
+
+    async function renderDetail() {
+      const a = state.selected; detailCard.innerHTML = ''; if (!a) return;
+      const def = assetDef(a.asset_type);
+      const [history, photos] = await Promise.all([loadAssetChangeLog(a.asset_type, a.id), loadAssetPhotos(a.asset_type, a.id)]);
+
+      const card = el('div', { class: 'card' }, [
+        el('div', { class: 'card-header' }, [el('h3', {}, [def.label + ' — ' + (a.name || a.id)]), el('button', { class: 'btn btn-ghost btn-sm', onclick: () => { state.selected = null; detailCard.innerHTML = ''; } }, ['Tutup'])]),
+      ]);
+
+      // ---- Update Lokasi (Field Update / As Built) — hanya utk aset titik ----
+      if (a.lat != null) {
+        const latInput = el('input', { type: 'number', step: 'any', class: 'text-input', value: a.lat });
+        const lngInput = el('input', { type: 'number', step: 'any', class: 'text-input', value: a.lng });
+        const noteInput = el('input', { type: 'text', class: 'text-input', placeholder: 'Catatan (opsional)' });
+        const reasonInput = el('input', { type: 'text', class: 'text-input', placeholder: 'Alasan perubahan (opsional)' });
+        card.appendChild(el('div', { style: 'margin-bottom:14px;' }, [
+          el('h4', { class: 'text-sm' }, ['Update Lokasi (Field Update)']),
+          el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;' }, [latInput, lngInput, noteInput, reasonInput,
+            el('button', { class: 'btn btn-primary btn-sm', onclick: async () => {
+              const ok = await updateAssetLocation(a, parseFloat(latInput.value), parseFloat(lngInput.value), noteInput.value, reasonInput.value, 'move');
+              if (ok) renderDetail();
+            } }, ['Simpan']),
+          ]),
+        ]));
+      } else {
+        card.appendChild(el('p', { class: 'text-xs text-muted' }, ['Aset garis (geometri LineString) — edit lokasi/geometri belum didukung di halaman ini, lihat Mapping/Review Mode untuk mengubah jalurnya.']));
+      }
+
+      // ---- Riwayat Versi (Version History) + Restore ----
+      card.appendChild(el('h4', { class: 'text-sm' }, ['Riwayat Versi (' + history.length + ')']));
+      if (!history.length) card.appendChild(el('p', { class: 'text-xs text-muted' }, ['Belum ada riwayat perubahan.']));
+      else card.appendChild(el('div', { class: 'table-wrap' }, [el('table', { class: 'data-table' }, [
+        el('thead', {}, [el('tr', {}, ['Versi', 'Tanggal', 'Tipe', 'Lama', 'Baru', 'Oleh', 'Catatan/Alasan', ''].map((h) => el('th', {}, [h])))]),
+        el('tbody', {}, history.map((h, idx) => el('tr', {}, [
+          el('td', {}, ['V' + (history.length - idx)]),
+          el('td', { class: 'text-xs' }, [new Date(h.created_at).toLocaleString('id-ID')]),
+          el('td', {}, [h.change_type]),
+          el('td', { class: 'text-xs' }, [h.old_lat != null ? (round1(h.old_lat) + ',' + round1(h.old_lng)) : '-']),
+          el('td', { class: 'text-xs' }, [h.new_lat != null ? (round1(h.new_lat) + ',' + round1(h.new_lng)) : '-']),
+          el('td', { class: 'text-xs' }, [h.changed_by_name || '-']),
+          el('td', { class: 'text-xs' }, [h.note || h.reason || '-']),
+          el('td', {}, [h.old_lat != null ? el('button', { class: 'btn btn-ghost btn-sm', title: 'Restore ke koordinat ini', onclick: async () => { const ok = await updateAssetLocation(a, h.old_lat, h.old_lng, 'Restore ke ' + new Date(h.created_at).toLocaleString('id-ID'), 'restore', 'restore'); if (ok) renderDetail(); } }, [el('i', { class: 'fa-solid fa-clock-rotate-left' })]) : null]),
+        ]))),
+      ])]));
+
+      // ---- Foto Dokumentasi ----
+      card.appendChild(el('h4', { class: 'text-sm' }, ['Foto Dokumentasi']));
+      const photoTypeSel = el('select', { class: 'text-input' }, ['before', 'after', 'qc', 'maintenance', 'damage'].map((t) => el('option', { value: t }, [t])));
+      const fileInput = el('input', { type: 'file', accept: 'image/*' });
+      card.appendChild(el('div', { style: 'display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap;' }, [
+        photoTypeSel, fileInput,
+        el('button', { class: 'btn btn-secondary btn-sm', onclick: async () => {
+          const file = fileInput.files[0]; if (!file) { toast('Pilih file foto dahulu.', 'warning'); return; }
+          const path = a.asset_type + '/' + a.id + '/' + Date.now() + '_' + file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+          try {
+            const { error: upErr } = await App.supabase.storage.from('asset-photos').upload(path, file);
+            if (upErr) throw upErr;
+            const { data: pub } = App.supabase.storage.from('asset-photos').getPublicUrl(path);
+            await App.supabase.from('asset_photo').insert({ project_id: a.project_id, asset_type: a.asset_type, asset_id: a.id, photo_type: photoTypeSel.value, url: pub.publicUrl, uploaded_by: uid() });
+            toast('Foto diunggah.', 'success'); renderDetail();
+          } catch (e) { toast('Gagal unggah foto — pastikan bucket Storage "asset-photos" sudah dibuat di Supabase Dashboard.', 'error'); }
+        } }, ['Unggah']),
+      ]));
+      const photoGrid = el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;' });
+      photos.forEach((p) => photoGrid.appendChild(el('div', { style: 'text-align:center;' }, [
+        el('img', { src: p.url, style: 'width:100px;height:100px;object-fit:cover;border-radius:6px;border:1px solid var(--color-border);' }),
+        el('div', { class: 'text-xs text-muted' }, [p.photo_type]),
+      ])));
+      card.appendChild(photoGrid);
+
+      // ---- Upload Dokumen (PDF/Excel/Word/Drawing) — menutup celah FINAL_AUDIT_REPORT.md ----
+      const docs = await loadAssetDocuments(a.asset_type, a.id);
+      card.appendChild(el('h4', { class: 'text-sm', style: 'margin-top:14px;' }, ['Dokumen']));
+      const docTypeSel = el('select', { class: 'text-input' }, ['pdf', 'excel', 'word', 'foto', 'drawing'].map((t) => el('option', { value: t }, [t])));
+      const docFileInput = el('input', { type: 'file' });
+      card.appendChild(el('div', { style: 'display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap;' }, [
+        docTypeSel, docFileInput,
+        el('button', { class: 'btn btn-secondary btn-sm', onclick: async () => {
+          const file = docFileInput.files[0]; if (!file) { toast('Pilih file dokumen dahulu.', 'warning'); return; }
+          const path = a.asset_type + '/' + a.id + '/' + Date.now() + '_' + file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+          try {
+            const { error: upErr } = await App.supabase.storage.from('asset-documents').upload(path, file);
+            if (upErr) throw upErr;
+            const { data: pub } = App.supabase.storage.from('asset-documents').getPublicUrl(path);
+            await App.supabase.from('asset_document').insert({ project_id: a.project_id, asset_type: a.asset_type, asset_id: a.id, doc_type: docTypeSel.value, title: file.name, url: pub.publicUrl, uploaded_by: uid() });
+            toast('Dokumen diunggah.', 'success'); renderDetail();
+          } catch (e) { toast('Gagal unggah dokumen — pastikan bucket Storage "asset-documents" sudah dibuat di Supabase Dashboard.', 'error'); }
+        } }, ['Unggah']),
+      ]));
+      if (!docs.length) card.appendChild(el('p', { class: 'text-xs text-muted' }, ['Belum ada dokumen.']));
+      else card.appendChild(el('ul', { class: 'text-xs' }, docs.map((d) => el('li', {}, [
+        el('a', { href: d.url, target: '_blank', rel: 'noopener' }, [d.title || d.doc_type]),
+        ' — ' + d.doc_type + ' — ' + new Date(d.created_at).toLocaleDateString('id-ID'),
+      ]))));
+
+      detailCard.appendChild(card);
+    }
+
+    renderList();
+  });
+
+  // ---------- GLOBAL MAP (semua project, semua layer) ----------
+  registerModule('global-map', async function renderGlobalMap(container) {
+    container.innerHTML = ''; $('#page-toolbar').innerHTML = '';
+    if (App.globalMap) { try { App.globalMap.remove(); } catch (e) {} App.globalMap = null; } // PRODUCTION HARDENING: cegah memory leak Leaflet saat pindah halaman
+    const mapWrap = el('div', { id: 'global-map-el', style: 'height:calc(100vh - var(--topbar-height) - 90px);' });
+    container.appendChild(el('div', { class: 'card', style: 'padding:0;overflow:hidden;' }, [mapWrap]));
+    setTimeout(async () => {
+      const map = L.map(mapWrap, { zoomControl: true }).setView(CFG.DEFAULT_CENTER, CFG.DEFAULT_ZOOM);
+      App.globalMap = map;
+      L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { attribution: 'Tiles &copy; Esri', maxZoom: 20 }).addTo(map);
+
+      const [points, buildings] = await Promise.all([
+        loadAllPointAssets(),
+        (async () => { try { const { data } = await App.supabase.from('detected_buildings').select('lat,lng,category,status').limit(ASSET_FETCH_LIMIT); return data || []; } catch (e) { return []; } })(),
+      ]);
+
+      const layerGroups = {};
+      const colorOf = { pole: '#8E6E53', odp: '#1F7A54', odc: '#0B6E99', home: '#B3261E', closure: '#9A6700', handhole: '#5B6774', jointbox: '#6B4EA0' };
+      ASSET_DEFS.forEach((def) => {
+        const pts = points.filter((p) => p.asset_type === def.type && p.lat != null);
+        // PRODUCTION HARDENING: pakai marker clustering (bukan layerGroup polos)
+        // supaya tetap responsif walau jumlah aset besar (ribuan-puluhan ribu titik).
+        const lg = window.L.markerClusterGroup ? L.markerClusterGroup({ disableClusteringAtZoom: 18 }) : L.layerGroup();
+        pts.forEach((p) => lg.addLayer(L.circleMarker([p.lat, p.lng], { radius: 5, color: colorOf[def.type] || '#333', fillOpacity: 0.85 }).bindPopup('<b>' + def.label + '</b><br>' + (p.name || '-') + '<br>Status: ' + p.asset_status)));
+        layerGroups[def.label] = lg;
+      });
+      const buildingCluster = window.L.markerClusterGroup ? L.markerClusterGroup({ disableClusteringAtZoom: 18, chunkedLoading: true }) : L.layerGroup();
+      buildings.filter((b) => b.lat != null).forEach((b) => buildingCluster.addLayer(L.circleMarker([b.lat, b.lng], { radius: 4, color: '#2563EB', fillOpacity: 0.7 }).bindPopup('Kategori: ' + (b.category || '-') + '<br>Status: ' + (b.status || '-'))));
+      layerGroups['Home Passed / Detected Building'] = buildingCluster;
+
+      Object.values(layerGroups).forEach((lg) => lg.addTo(map));
+      L.control.layers({}, layerGroups, { collapsed: false, position: 'topright' }).addTo(map);
+
+      const allPts = points.filter((p) => p.lat != null).map((p) => [p.lat, p.lng]).concat(buildings.filter((b) => b.lat != null).map((b) => [b.lat, b.lng]));
+      if (allPts.length) { try { map.fitBounds(allPts, { maxZoom: 16 }); } catch (e) {} }
+      toast('Global Map: ' + points.length + ' aset & ' + buildings.length + ' bangunan dimuat lintas seluruh project.', 'info');
+      if (points._truncated) toast('Data aset dibatasi ' + ASSET_FETCH_LIMIT + ' baris/tabel untuk menjaga performa — sebagian data mungkin belum tampil.', 'warning', 6000);
+    }, 50);
+  }, function destroyGlobalMap() {
+    if (App.globalMap) { try { App.globalMap.remove(); } catch (e) {} App.globalMap = null; }
+  });
+
+  // ---------- ASSET & QC REPORTS ----------
+  registerModule('asset-reports', async function renderAssetReports(container) {
+    container.innerHTML = ''; $('#page-toolbar').innerHTML = '';
+    const [points, lines] = await Promise.all([loadAllPointAssets(), loadAllLineAssets()]);
+    const all = points.concat(lines);
+    const changeLog = await (async () => { try { const { data } = await App.supabase.from('asset_change_log').select('*').order('created_at', { ascending: false }).limit(2000); return data || []; } catch (e) { return []; } })();
+    const photos = await (async () => { try { const { data } = await App.supabase.from('asset_photo').select('*'); return data || []; } catch (e) { return []; } })();
+
+    const PF = window.PlanningFinal;
+    const reports = PF.buildAllAssetReports({ assets: all, changeLog, photos });
+    const fname = 'asset_reports_' + new Date().toISOString().slice(0, 10);
+
+    container.appendChild(el('div', { class: 'card' }, [
+      el('div', { class: 'card-header' }, [el('h3', {}, ['Export'])]),
+      el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;' }, [
+        el('button', { class: 'btn btn-secondary btn-sm', onclick: () => PF.downloadBlob(fname + '.xls', 'application/vnd.ms-excel', PF.reportsToXLS(reports)) }, ['Semua Report (Excel)']),
+        el('button', { class: 'btn btn-secondary btn-sm', onclick: () => PF.downloadBlob(fname + '_assets.geojson', 'application/geo+json', PF.assetsToGeoJSON(all)) }, ['Export Asset (GeoJSON)']),
+        el('button', { class: 'btn btn-secondary btn-sm', onclick: () => PF.downloadBlob(fname + '_assets.kml', 'application/vnd.google-earth.kml+xml', PF.assetsToKML(all, 'Assets')) }, ['Export Asset (KML)']),
+        el('button', { class: 'btn btn-secondary btn-sm', onclick: async () => { const blob = await PF.assetsToKMZ(all, 'Assets'); PF.downloadBlob(fname + '_assets.kmz', 'application/vnd.google-earth.kmz', blob); } }, ['Export Asset (KMZ)']),
+        el('button', { class: 'btn btn-secondary btn-sm', onclick: () => PF.openPrintable(Object.values(reports).map((r) => PF.reportToHtmlTable(r)).join(''), 'Asset & QC Reports') }, ['Cetak / PDF']),
+      ]),
+    ]));
+
+    Object.values(reports).forEach((rep) => {
+      container.appendChild(el('div', { class: 'card' }, [
+        el('div', { class: 'card-header' }, [el('h3', {}, [rep.title + ' (' + rep.rows.length + ')']), el('button', { class: 'btn btn-ghost btn-sm', onclick: () => PF.downloadBlob(fname + '_' + rep.title.replace(/\s+/g, '_') + '.csv', 'text/csv', PF.reportToCSV(rep)) }, ['CSV'])]),
+        el('div', { class: 'table-wrap' }, [el('table', { class: 'data-table' }, [
+          el('thead', {}, [el('tr', {}, rep.columns.map((c) => el('th', {}, [c])))]),
+          el('tbody', {}, rep.rows.slice(0, 200).map((r) => el('tr', {}, r.map((c) => el('td', {}, [String(c)]))))),
+        ])]),
+      ]));
+    });
+  });
+
+  async function injectAssetManagementDashboard(container) {
+    let assets = [];
+    try { const points = await loadAllPointAssets(); const lines = await loadAllLineAssets(); assets = points.concat(lines); } catch (e) { return; }
+    if (!assets.length) return;
+    const byStatus = { draft: 0, approved: 0, installed: 0, verified: 0, maintenance: 0, removed: 0 };
+    assets.forEach((a) => { if (byStatus[a.asset_status] != null) byStatus[a.asset_status]++; });
+    const stat = (label, value, icon) => el('div', { class: 'stat-card' }, [el('div', { class: 'stat-icon' }, [el('i', { class: 'fa-solid ' + icon })]), el('div', {}, [el('div', { class: 'stat-value' }, [String(value)]), el('div', { class: 'stat-label' }, [label])])]);
+    container.appendChild(el('div', { class: 'card', style: 'margin-top:16px;' }, [
+      el('div', { class: 'card-header' }, [el('h3', {}, ['Asset Management — Ringkasan'])]),
+      el('div', { class: 'stat-grid' }, [
+        stat('Total Asset', fmtNumber(assets.length), 'fa-toolbox'),
+        stat('Draft', byStatus.draft, 'fa-pen'),
+        stat('Approved', byStatus.approved, 'fa-circle-check'),
+        stat('Total Construction', byStatus.installed, 'fa-person-digging'),
+        stat('Total QC', byStatus.verified, 'fa-clipboard-check'),
+        stat('Maintenance', byStatus.maintenance, 'fa-screwdriver-wrench'),
+        stat('Total As Built', byStatus.installed + byStatus.verified + byStatus.maintenance, 'fa-map-location-dot'),
+      ]),
+    ]));
   }
 
   /* ================= [CORE] SCREEN SWITCHING ================= */
@@ -3228,11 +4174,8 @@
     });
     $('#menu-setting').addEventListener('click', (e) => { e.preventDefault(); location.hash = '#/setting'; });
 
-    $('#global-search').addEventListener('input', debounce((e) => {
-      // Pencarian global lintas modul akan disempurnakan bertahap seiring
-      // tabel data (rumah/ODC/ODP/project) tersedia di Fase 2+.
-      console.log('search:', e.target.value);
-    }, 300));
+    $('#global-search').addEventListener('input', debounce((e) => runGlobalSearch(e.target.value), 300));
+    document.addEventListener('click', (e) => { if (!e.target.closest('.topbar-search')) hideGlobalSearchResults(); });
 
     window.addEventListener('hashchange', handleHashChange);
 
@@ -3246,12 +4189,172 @@
     history.pushState(null, '', location.href);
   }
 
+  /* ================= [FINAL] OFFLINE DETECTION ================= */
+  // Menutup celah dari FINAL_AUDIT_REPORT.md: sebelumnya tidak ada deteksi
+  // koneksi sama sekali. Banner persisten (bukan toast yang hilang sendiri)
+  // supaya planner sadar perubahan berisiko tidak tersimpan saat offline.
+  function initOfflineDetection() {
+    const banner = el('div', { id: 'offline-banner', class: 'hidden', style: 'position:fixed;top:0;left:0;right:0;z-index:9998;background:#B3261E;color:#fff;text-align:center;padding:8px 12px;font-size:13px;font-weight:600;' }, [
+      el('i', { class: 'fa-solid fa-wifi', style: 'margin-right:8px;' }),
+      'Anda sedang OFFLINE — perubahan mungkin tidak tersimpan sampai koneksi kembali.',
+    ]);
+    document.body.appendChild(banner);
+    function setOnline(isOnline) {
+      banner.classList.toggle('hidden', isOnline);
+      if (!isOnline) toast('Koneksi internet terputus.', 'error', 6000);
+      else toast('Koneksi internet kembali normal.', 'success', 3000);
+    }
+    window.addEventListener('online', () => setOnline(true));
+    window.addEventListener('offline', () => setOnline(false));
+    if (!navigator.onLine) setOnline(false);
+  }
+
+  /* ================= [FINAL] BACKUP & RESTORE ================= */
+  // Menutup celah dari FINAL_AUDIT_REPORT.md (sebelumnya hanya ada "Restore"
+  // versi planning, BUKAN backup/restore database). Additive, halaman baru.
+  const BACKUP_TABLES = [
+    'projects', 'areas', 'pops', 'odc', 'odp', 'homes', 'poles', 'backbones',
+    'distributions', 'kabels', 'closures', 'handholes', 'jointboxes',
+    'planning_analysis', 'building_analysis', 'road_analysis', 'coverage_analysis',
+    'planning_home', 'planning_odp', 'planning_odc', 'planning_backbone', 'planning_distribution', 'planning_boq',
+    'planning_version', 'planning_validation', 'planning_approval', 'planning_history', 'planning_report',
+    'detected_buildings', 'asset_change_log', 'asset_photo', 'asset_document',
+  ];
+  const BACKUP_PROJECT_SCOPED_TABLES = [
+    'areas', 'pops', 'odc', 'odp', 'homes', 'poles', 'backbones',
+    'distributions', 'kabels', 'closures', 'handholes', 'jointboxes', 'planning_analysis',
+  ];
+
+  ROUTE_TITLES['backup-restore'] = 'Backup & Restore';
+  registerModule('backup-restore', async function renderBackupRestore(container) {
+    container.innerHTML = ''; $('#page-toolbar').innerHTML = '';
+
+    container.appendChild(el('div', { class: 'card' }, [
+      el('div', { class: 'card-header' }, [el('h3', {}, ['Export Database (Backup)'])]),
+      el('p', { class: 'text-xs text-muted' }, ['Mengunduh seluruh isi ' + BACKUP_TABLES.length + ' tabel (kecuali data akun/auth) sebagai 1 file JSON. Simpan file ini di tempat aman.']),
+      el('button', { class: 'btn btn-primary btn-sm', onclick: () => exportDatabase(null) }, [el('i', { class: 'fa-solid fa-download' }), ' Export Seluruh Database']),
+    ]));
+
+    const projectSelect = el('select', { class: 'text-input', style: 'max-width:320px;' }, [el('option', { value: '' }, ['— pilih project —'])]);
+    (async () => { try { const { data } = await App.supabase.from('projects').select('id,name').order('created_at', { ascending: false }).limit(500); (data || []).forEach((p) => projectSelect.appendChild(el('option', { value: p.id }, [p.name]))); } catch (e) {} })();
+    container.appendChild(el('div', { class: 'card' }, [
+      el('div', { class: 'card-header' }, [el('h3', {}, ['Backup Project (per-project)'])]),
+      el('p', { class: 'text-xs text-muted' }, ['Export seluruh data milik 1 project (' + BACKUP_PROJECT_SCOPED_TABLES.length + ' tabel yang punya project_id).']),
+      el('div', { style: 'display:flex;gap:8px;align-items:center;' }, [
+        projectSelect,
+        el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { if (!projectSelect.value) { toast('Pilih project dahulu.', 'warning'); return; } exportDatabase(projectSelect.value); } }, [el('i', { class: 'fa-solid fa-download' }), ' Backup Project Ini']),
+      ]),
+    ]));
+
+    const fileInput = el('input', { type: 'file', accept: 'application/json' });
+    container.appendChild(el('div', { class: 'card' }, [
+      el('div', { class: 'card-header' }, [el('h3', {}, ['Import / Restore Database'])]),
+      el('p', { class: 'text-xs text-muted' }, [
+        '⚠ Import akan melakukan UPSERT (menimpa baris dengan id yang sama, menambah baris baru).',
+        ' Tidak menghapus data yang sudah ada. Gunakan file hasil "Export Database"/"Backup Project" di atas.',
+      ]),
+      el('div', { style: 'display:flex;gap:8px;align-items:center;' }, [
+        fileInput,
+        el('button', { class: 'btn btn-secondary btn-sm', onclick: async () => {
+          const file = fileInput.files[0]; if (!file) { toast('Pilih file backup (.json) dahulu.', 'warning'); return; }
+          const ok = await confirmDialog('Import/Restore dari file ini? Data dengan id yang sama akan ditimpa.', 'Import Database');
+          if (!ok) return;
+          try {
+            const text = await file.text();
+            const parsed = JSON.parse(text);
+            await importDatabase(parsed);
+          } catch (e) { toast('Gagal membaca/import file: ' + e.message, 'error'); }
+        } }, [el('i', { class: 'fa-solid fa-upload' }), ' Import / Restore']),
+      ]),
+    ]));
+  });
+
+  async function exportDatabase(projectId) {
+    const tables = projectId ? BACKUP_PROJECT_SCOPED_TABLES : BACKUP_TABLES;
+    const dump = { exported_at: new Date().toISOString(), scope: projectId ? ('project:' + projectId) : 'full', tables: {} };
+    toast('Mengekspor ' + tables.length + ' tabel...', 'info');
+    for (const t of tables) {
+      try {
+        let q = App.supabase.from(t).select('*').limit(50000);
+        if (projectId) q = t === 'projects' ? q.eq('id', projectId) : q.eq('project_id', projectId);
+        const { data, error } = await q;
+        dump.tables[t] = error ? [] : (data || []);
+      } catch (e) { dump.tables[t] = []; }
+    }
+    if (projectId) {
+      try { const { data } = await App.supabase.from('projects').select('*').eq('id', projectId).limit(1); dump.tables.projects = data || []; } catch (e) {}
+    }
+    const fname = (projectId ? 'backup_project_' + projectId : 'backup_database') + '_' + new Date().toISOString().slice(0, 10) + '.json';
+    window.PlanningFinal.downloadBlob(fname, 'application/json', JSON.stringify(dump, null, 2));
+    toast('Backup selesai diunduh: ' + fname, 'success');
+  }
+
+  async function importDatabase(parsed) {
+    if (!parsed || !parsed.tables) { toast('Format file backup tidak dikenali.', 'error'); return; }
+    let okCount = 0, failCount = 0;
+    for (const t of Object.keys(parsed.tables)) {
+      const rows = parsed.tables[t];
+      if (!Array.isArray(rows) || !rows.length) continue;
+      try {
+        const { error } = await App.supabase.from(t).upsert(rows, { onConflict: 'id' });
+        if (error) throw error;
+        okCount += rows.length;
+      } catch (e) { failCount++; console.warn('[Backup] gagal import tabel', t, e.message); }
+    }
+    toast('Import selesai: ' + okCount + ' baris berhasil, ' + failCount + ' tabel gagal (lihat console).', failCount ? 'warning' : 'success', 6000);
+  }
+  /* ================= [FINAL] GLOBAL SEARCH ================= */
+  // Menutup celah dari FINAL_AUDIT_REPORT.md — sebelumnya input ini tidak
+  // melakukan apa pun (hanya console.log). Mencari lintas Project/Rumah/
+  // ODP/ODC berdasarkan nama, ditampilkan sebagai dropdown di bawah kotak cari.
+  function hideGlobalSearchResults() {
+    const box = document.getElementById('global-search-results');
+    if (box) box.classList.add('hidden');
+  }
+  async function runGlobalSearch(q) {
+    q = (q || '').trim();
+    const wrap = document.querySelector('.topbar-search');
+    let box = document.getElementById('global-search-results');
+    if (!box) {
+      box = el('div', { id: 'global-search-results', class: 'card hidden', style: 'position:absolute;top:100%;left:0;right:0;margin-top:4px;max-height:320px;overflow:auto;z-index:500;padding:6px;' });
+      wrap.style.position = 'relative';
+      wrap.appendChild(box);
+    }
+    if (q.length < 2) { box.classList.add('hidden'); return; }
+    box.innerHTML = '<div class="text-xs text-muted" style="padding:6px;">Mencari...</div>';
+    box.classList.remove('hidden');
+
+    const [projects, homes, odps, odcs] = await Promise.all([
+      App.supabase.from('projects').select('id,name').ilike('name', '%' + q + '%').limit(5).then((r) => r.data || []).catch(() => []),
+      App.supabase.from('homes').select('id,owner_name,lat,lng').ilike('owner_name', '%' + q + '%').limit(5).then((r) => r.data || []).catch(() => []),
+      App.supabase.from('odp').select('id,name,lat,lng').ilike('name', '%' + q + '%').limit(5).then((r) => r.data || []).catch(() => []),
+      App.supabase.from('odc').select('id,name,lat,lng').ilike('name', '%' + q + '%').limit(5).then((r) => r.data || []).catch(() => []),
+    ]);
+
+    box.innerHTML = '';
+    const section = (title, items, onClick) => {
+      if (!items.length) return;
+      box.appendChild(el('div', { class: 'text-xs text-muted', style: 'padding:4px 6px;font-weight:700;' }, [title]));
+      items.forEach((it) => {
+        const row = el('div', { class: 'nav-item', style: 'padding:6px 8px;cursor:pointer;' }, [it.name || it.owner_name || it.id]);
+        row.addEventListener('click', () => { hideGlobalSearchResults(); onClick(it); });
+        box.appendChild(row);
+      });
+    };
+    section('Project', projects, (p) => { location.hash = '#/project-detail?id=' + p.id; });
+    section('Rumah', homes, (h) => { if (h.lat != null) { location.hash = '#/mapping'; setTimeout(() => { if (App.map) { App.map.setView([h.lat, h.lng], 18); L.marker([h.lat, h.lng]).addTo(App.map).bindPopup(h.owner_name).openPopup(); } }, 300); } });
+    section('ODP', odps, (o) => { if (o.lat != null) { location.hash = '#/mapping'; setTimeout(() => { if (App.map) { App.map.setView([o.lat, o.lng], 18); L.marker([o.lat, o.lng]).addTo(App.map).bindPopup(o.name).openPopup(); } }, 300); } });
+    section('ODC', odcs, (o) => { if (o.lat != null) { location.hash = '#/mapping'; setTimeout(() => { if (App.map) { App.map.setView([o.lat, o.lng], 18); L.marker([o.lat, o.lng]).addTo(App.map).bindPopup(o.name).openPopup(); } }, 300); } });
+    if (!box.childNodes.length) box.innerHTML = '<div class="text-xs text-muted" style="padding:6px;">Tidak ada hasil untuk "' + q + '".</div>';
+  }
+
   /* ================= [CORE] BOOTSTRAP ================= */
   async function bootstrap() {
     buildSidebar();
     injectSmartPlanningNav(); // additive: menu Smart Planning (Coming Soon/disabled)
     bindGlobalEvents();
     initSupabase();
+    initOfflineDetection();
 
     const savedTheme = localStorage.getItem('ma_theme') || CFG.THEME;
     applyTheme(savedTheme);

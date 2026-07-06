@@ -32,11 +32,14 @@
   }
 
   var DEFAULTS = {
-    odpCapacity: 8,        // 1 ODP = maksimum 8 Home Passed
-    odcCapacity: 4,        // 1 ODC = maksimum 4 ODP
-    poleSpanM: 40,         // jarak antar tiang (40/50/60), dapat diubah
-    handholeSpanM: 200,    // jarak antar handhole di backbone
-    homesPerApartment: 1,  // unit rumah per apartemen (default 1)
+    odpCapacity: 8,          // 1 ODP = maksimum 8 Home Passed
+    odcCapacity: 4,          // 1 ODC = maksimum 4 ODP
+    poleSpanM: 40,           // jarak antar tiang (30/35/40/45/50), dapat diubah
+    handholeSpanM: 200,      // jarak antar handhole di backbone
+    homesPerApartment: 1,    // unit rumah per apartemen (default 1)
+    odpCoverageRadiusM: 100, // radius coverage ODP (default 100 m)
+    reserveCorePct: 20,      // cadangan core (%)
+    cableReservePct: 10,     // cadangan panjang kabel (%)
   };
 
   /* ---- util jarak (haversine, meter) ---- */
@@ -272,37 +275,203 @@
     var handholeSpan = options.handholeSpanM || DEFAULTS.handholeSpanM;
     var odpCount = ctx.odps.length, odcCount = ctx.odcs.length;
     var bbLen = ctx.backbone.length_m, distLen = ctx.distribution.length_m;
+    var dropLen = ctx.drop ? ctx.drop.length_m : 0;
+    var dropCount = ctx.drop ? ctx.drop.count : 0;
+    var poleCount = ctx.poles ? ctx.poles.count : 0;
+    var coreCount = ctx.homePassed != null ? ctx.homePassed : dropCount;               // 1 core per rumah
+    var reserveCore = Math.ceil(coreCount * (options.reserveCorePct != null ? options.reserveCorePct : DEFAULTS.reserveCorePct) / 100);
+    var cableTotal = bbLen + distLen + dropLen;
+    var cableReserve = Math.ceil(cableTotal * (options.cableReservePct != null ? options.cableReservePct : DEFAULTS.cableReservePct) / 100);
     var boq = {
+      pole_count: poleCount,
       odp_count: odpCount,
       odc_count: odcCount,
-      pole_count: ctx.poles.count,
-      pole_span_m: ctx.poles.span_m,
+      pole_span_m: ctx.poles ? ctx.poles.span_m : (options.poleSpanM || DEFAULTS.poleSpanM),
       backbone_length_m: bbLen,
       distribution_length_m: distLen,
+      drop_length_m: dropLen,
+      drop_count: dropCount,
       closure_count: odcCount,                                   // splice di tiap ODC
       handhole_count: handholeSpan > 0 ? Math.ceil(bbLen / handholeSpan) : 0,
       jointbox_count: odpCount,                                  // 1 per area ODP
+      connector_count: (odpCount + odcCount) * 2 + dropCount,    // patchcord + drop
       cable_backbone_m: bbLen,
       cable_distribution_m: distLen,
+      cable_drop_m: dropLen,
+      cable_length_m: cableTotal,
+      core_count: coreCount,
+      reserve_core: reserveCore,
+      cable_reserve_m: cableReserve,
     };
     boq.items = [
+      { item: 'Tiang (span ' + boq.pole_span_m + ' m)', unit: 'batang', quantity: boq.pole_count },
       { item: 'ODP (splitter 1:8)', unit: 'unit', quantity: boq.odp_count },
       { item: 'ODC (splitter 1:4)', unit: 'unit', quantity: boq.odc_count },
-      { item: 'Tiang (span ' + boq.pole_span_m + ' m)', unit: 'batang', quantity: boq.pole_count },
       { item: 'Backbone', unit: 'meter', quantity: boq.backbone_length_m },
       { item: 'Distribution', unit: 'meter', quantity: boq.distribution_length_m },
+      { item: 'Drop Cable', unit: 'meter', quantity: boq.drop_length_m },
       { item: 'Closure', unit: 'unit', quantity: boq.closure_count },
       { item: 'Handhole', unit: 'unit', quantity: boq.handhole_count },
       { item: 'Joint Box', unit: 'unit', quantity: boq.jointbox_count },
+      { item: 'Connector', unit: 'unit', quantity: boq.connector_count },
       { item: 'Kabel Backbone', unit: 'meter', quantity: boq.cable_backbone_m },
       { item: 'Kabel Distribusi', unit: 'meter', quantity: boq.cable_distribution_m },
+      { item: 'Kabel Drop', unit: 'meter', quantity: boq.cable_drop_m },
+      { item: 'Core (total)', unit: 'core', quantity: boq.core_count },
+      { item: 'Reserve Core', unit: 'core', quantity: boq.reserve_core },
+      { item: 'Cadangan Kabel', unit: 'meter', quantity: boq.cable_reserve_m },
     ];
     return boq;
   }
 
   /* =====================================================================
-     GEOJSON builder untuk peta
+     REVISION 02 — AUTO NETWORK ENGINE (routing jalan, pole, drop, koneksi)
      ===================================================================== */
+  var R2_VERSION = '0.5.0-rev02-auto-network';
+  var MAX_GRAPH_NODES = 2500;   // guard performa Dijkstra
+  var MAX_POLES = 6000;
+
+  function roundKey(c) { return (+c[0]).toFixed(5) + ',' + (+c[1]).toFixed(5); }
+
+  // Bangun graph dari jaringan jalan (node = titik, edge = ruas).
+  function buildRoadGraph(roadsFC) {
+    var nodes = [], index = {}, adj = [];
+    function nodeOf(c) { var k = roundKey(c); if (index[k] == null) { index[k] = nodes.length; nodes.push([+c[0], +c[1]]); adj.push([]); } return index[k]; }
+    if (roadsFC && roadsFC.features) {
+      roadsFC.features.forEach(function (f) {
+        var g = f.geometry; if (!g) return;
+        var lines = g.type === 'LineString' ? [g.coordinates] : (g.type === 'MultiLineString' ? g.coordinates : []);
+        lines.forEach(function (cs) {
+          for (var i = 1; i < cs.length; i++) {
+            if (nodes.length > MAX_GRAPH_NODES) return;
+            var a = nodeOf(cs[i - 1]), b = nodeOf(cs[i]);
+            var w = havM(nodes[a], nodes[b]);
+            adj[a].push({ to: b, w: w }); adj[b].push({ to: a, w: w });
+          }
+        });
+      });
+    }
+    return { nodes: nodes, adj: adj };
+  }
+  function nearestNode(graph, coord) {
+    var best = -1, bd = Infinity;
+    for (var i = 0; i < graph.nodes.length; i++) { var d = havM(graph.nodes[i], coord); if (d < bd) { bd = d; best = i; } }
+    return best;
+  }
+  // Jalur mengikuti jalan via Dijkstra; fallback garis lurus bila tak terhubung.
+  function routeAlong(graph, a, b) {
+    if (!graph || !graph.nodes.length || graph.nodes.length > MAX_GRAPH_NODES) return { coords: [a, b], length_m: lineLenM([a, b]), routed: false };
+    var s = nearestNode(graph, a), t = nearestNode(graph, b);
+    if (s < 0 || t < 0 || s === t) return { coords: [a, b], length_m: lineLenM([a, b]), routed: false };
+    var n = graph.nodes.length, dist = new Array(n).fill(Infinity), prev = new Array(n).fill(-1), done = new Array(n).fill(false);
+    dist[s] = 0;
+    for (var it = 0; it < n; it++) {
+      var u = -1, ud = Infinity;
+      for (var k = 0; k < n; k++) { if (!done[k] && dist[k] < ud) { ud = dist[k]; u = k; } }
+      if (u < 0 || u === t) break; done[u] = true;
+      var au = graph.adj[u];
+      for (var j = 0; j < au.length; j++) { var e = au[j], nd = dist[u] + e.w; if (nd < dist[e.to]) { dist[e.to] = nd; prev[e.to] = u; } }
+    }
+    if (dist[t] === Infinity) return { coords: [a, b], length_m: lineLenM([a, b]), routed: false };
+    var path = [], cur = t; while (cur !== -1) { path.push(graph.nodes[cur]); cur = prev[cur]; } path.reverse();
+    var coords = [a].concat(path, [b]);
+    return { coords: coords, length_m: lineLenM(coords), routed: true };
+  }
+
+  // POP otomatis: centroid ODC di-snap ke jalan.
+  function autoPlacePop(odcs, roadsFC) {
+    if (!odcs || !odcs.length) return null;
+    var cx = 0, cy = 0; odcs.forEach(function (o) { cx += o.lng; cy += o.lat; });
+    var c = snapToRoads([cx / odcs.length, cy / odcs.length], roadsFC);
+    return { pop_id: 'POP-001', lng: c[0], lat: c[1] };
+  }
+
+  // Backbone mengikuti jalan: MST(POP+ODC) lalu tiap ruas dirutekan via jalan.
+  function planBackboneRouted(pop, odcs, graph, options) {
+    var t = turf();
+    var pts = []; if (pop) pts.push([pop.lng, pop.lat]); odcs.forEach(function (o) { pts.push([o.lng, o.lat]); });
+    var feats = [], length = 0;
+    if (pts.length >= 2) {
+      mstEdges(pts).forEach(function (e) {
+        var r = routeAlong(graph, pts[e[0]], pts[e[1]]);
+        length += r.length_m; feats.push(t.lineString(r.coords, { kind: 'backbone' }));
+      });
+    }
+    return { featureCollection: t.featureCollection(feats), length_m: Math.round(length), segment_count: feats.length };
+  }
+  // Distribution mengikuti jalan: ODC -> tiap ODP dirutekan via jalan.
+  function planDistributionRouted(odcs, odps, graph, options) {
+    var t = turf();
+    var byId = {}; odps.forEach(function (o) { byId[o.odp_id] = o; });
+    var feats = [], length = 0;
+    odcs.forEach(function (odc) {
+      (odc.odp_ids || []).forEach(function (oid) {
+        var o = byId[oid]; if (!o) return;
+        var r = routeAlong(graph, [odc.lng, odc.lat], [o.lng, o.lat]);
+        length += r.length_m; feats.push(t.lineString(r.coords, { kind: 'distribution', odc: odc.odc_id, odp: oid }));
+      });
+    });
+    return { featureCollection: t.featureCollection(feats), length_m: Math.round(length), segment_count: feats.length };
+  }
+
+  // Tiang otomatis sepanjang jalur kabel (mengikuti jalan), tiap span meter.
+  function planPolesAlong(lineFCList, options) {
+    var t = turf();
+    var span = (options && options.poleSpanM) || DEFAULTS.poleSpanM;
+    var pts = [], pid = 1, cableTotal = 0;
+    lineFCList.forEach(function (fc) {
+      if (!fc || !fc.features) return;
+      fc.features.forEach(function (f) {
+        if (!f.geometry || f.geometry.type !== 'LineString') return;
+        var ls = t.lineString(f.geometry.coordinates);
+        var len = t.length(ls, { units: 'kilometers' }) * 1000; cableTotal += len;
+        var n = Math.floor(len / span);
+        for (var i = 1; i <= n; i++) {
+          if (pts.length >= MAX_POLES) break;
+          var p = t.along(ls, (i * span) / 1000, { units: 'kilometers' });
+          var c = p.geometry.coordinates;
+          pts.push({ pole_id: 'PL-' + pad(pid++, 5), lng: c[0], lat: c[1] });
+        }
+      });
+    });
+    return { points: pts, count: pts.length, span_m: span, cable_total_m: Math.round(cableTotal), featureCollection: t.featureCollection(pts.map(function (p) { return t.point([p.lng, p.lat], { id: p.pole_id }); })) };
+  }
+
+  // Drop cable ODP -> Rumah + record Home Passed detail.
+  function planDrop(odps, homeCoordById, options) {
+    var t = turf();
+    var feats = [], records = [], total = 0;
+    odps.forEach(function (odp) {
+      (odp.home_ids || []).forEach(function (hid) {
+        var c = homeCoordById[hid]; if (!c) return;
+        var seg = [[odp.lng, odp.lat], [c[0], c[1]]];
+        var d = lineLenM(seg); var drop = Math.round(d * 1.1 + 2);   // slack + tiang-ke-rumah
+        total += drop;
+        feats.push(t.lineString(seg, { kind: 'drop', odp: odp.odp_id, home: hid }));
+        records.push({ building_id: hid, lat: c[1], lng: c[0], odp_id: odp.odp_id, status: 'passed', distance_to_odp_m: Math.round(d), drop_length_m: drop });
+      });
+    });
+    return { featureCollection: t.featureCollection(feats), length_m: Math.round(total), count: feats.length, records: records };
+  }
+
+  // Smart Connection: Rumah -> ODP -> ODC -> POP.
+  function buildConnections(homeRecords, odcs, pop, odcCoordById, odpCoordById) {
+    var t = turf();
+    var edges = [], feats = [];
+    homeRecords.forEach(function (h) { edges.push({ from_type: 'home', from_id: h.building_id, to_type: 'odp', to_id: h.odp_id }); });
+    odcs.forEach(function (odc) {
+      (odc.odp_ids || []).forEach(function (oid) {
+        edges.push({ from_type: 'odp', from_id: oid, to_type: 'odc', to_id: odc.odc_id });
+      });
+      if (pop) {
+        edges.push({ from_type: 'odc', from_id: odc.odc_id, to_type: 'pop', to_id: pop.pop_id });
+        feats.push(t.lineString([[odc.lng, odc.lat], [pop.lng, pop.lat]], { kind: 'connection', from: odc.odc_id, to: pop.pop_id }));
+      }
+    });
+    return { edges: edges, featureCollection: t.featureCollection(feats) };
+  }
+
+
   function buildingsToFC(buildings) {
     var t = turf();
     return t.featureCollection(buildings.map(function (b) {
@@ -336,38 +505,104 @@
     var homeStats = computeHomePassed(buildings, areaSqm);
     var odps = planOdp(buildings, options);
     var odcs = planOdc(odps, options);
-    var backbone = planBackbone(odcs, roadsFC, options);
-    var distribution = planDistribution(odcs, odps, options);
-    var poles = estimatePoles(backbone.length_m, distribution.length_m, options);
-    var boq = generateBoq({ odps: odps, odcs: odcs, backbone: backbone, distribution: distribution, poles: poles }, options);
+
+    // Koordinat rumah (home passed) untuk drop cable.
+    var homeCoordById = {};
+    buildings.forEach(function (b) { if (b.is_home_passed) homeCoordById[b.building_id] = [b.lng, b.lat]; });
+
+    var graph = buildRoadGraph(roadsFC);
+    var pop = autoPlacePop(odcs, roadsFC);
+    var backbone = planBackboneRouted(pop, odcs, graph, options);       // mengikuti jalan
+    var distribution = planDistributionRouted(odcs, odps, graph, options); // mengikuti jalan
+    var drop = planDrop(odps, homeCoordById, options);                  // ODP -> Rumah
+    var poles = planPolesAlong([backbone.featureCollection, distribution.featureCollection], options); // objek tiang
+    var connections = buildConnections(drop.records, odcs, pop);
+    var boq = generateBoq({ odps: odps, odcs: odcs, backbone: backbone, distribution: distribution, drop: drop, poles: poles, homePassed: homeStats.home_passed }, options);
 
     return {
-      ok: true, status: 'ok', engineVersion: PHASE2_VERSION,
+      ok: true, status: 'ok', engineVersion: R2_VERSION,
       generation_id: (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : ('gen-' + Date.now()),
       generated_at: new Date().toISOString(),
-      params: { odpCapacity: options.odpCapacity, odcCapacity: options.odcCapacity, poleSpanM: options.poleSpanM, handholeSpanM: options.handholeSpanM },
+      params: {
+        odpCapacity: options.odpCapacity, odcCapacity: options.odcCapacity, poleSpanM: options.poleSpanM,
+        handholeSpanM: options.handholeSpanM, odpCoverageRadiusM: options.odpCoverageRadiusM,
+        reserveCorePct: options.reserveCorePct, cableReservePct: options.cableReservePct,
+      },
       buildings: buildings,
       buildingsFC: buildingsToFC(buildings),
       homePassedFC: homePassedFC(buildings),
       stats: homeStats,
+      pop: pop,
       odps: odps, odpFC: pointsToFC(odps, 'odp_id'),
       odcs: odcs, odcFC: pointsToFC(odcs, 'odc_id'),
       backbone: backbone,
       distribution: distribution,
-      poles: poles,
+      drop: drop, dropFC: drop.featureCollection,
+      poles: poles, poleFC: poles.featureCollection,
+      homePassedDetail: drop.records,
+      connections: connections.edges, connectionFC: connections.featureCollection,
       boq: boq,
     };
   }
 
-  // Regenerate hanya jalur & BOQ dari ODP/ODC terkini (dipakai Review Mode
-  // setelah planner memindah/menambah/menghapus ODP/ODC).
-  function regenerateLines(odps, odcs, roadsFC, options) {
+  // Regenerate jalur/tiang/drop/koneksi & BOQ dari ODP/ODC terkini (Review Mode).
+  // ctx opsional: { buildings, homeCoordById, pop } untuk menghitung ulang drop.
+  function regenerateLines(odps, odcs, roadsFC, options, ctx) {
     options = Object.assign({}, DEFAULTS, options || {});
-    var backbone = planBackbone(odcs, roadsFC, options);
-    var distribution = planDistribution(odcs, odps, options);
-    var poles = estimatePoles(backbone.length_m, distribution.length_m, options);
-    var boq = generateBoq({ odps: odps, odcs: odcs, backbone: backbone, distribution: distribution, poles: poles }, options);
-    return { backbone: backbone, distribution: distribution, poles: poles, boq: boq };
+    ctx = ctx || {};
+    var graph = buildRoadGraph(roadsFC);
+    var pop = ctx.pop || autoPlacePop(odcs, roadsFC);
+    var backbone = planBackboneRouted(pop, odcs, graph, options);
+    var distribution = planDistributionRouted(odcs, odps, graph, options);
+    var homeCoordById = ctx.homeCoordById || {};
+    if (!Object.keys(homeCoordById).length && ctx.buildings) ctx.buildings.forEach(function (b) { if (b.is_home_passed) homeCoordById[b.building_id] = [b.lng, b.lat]; });
+    var drop = planDrop(odps, homeCoordById, options);
+    var poles = planPolesAlong([backbone.featureCollection, distribution.featureCollection], options);
+    var connections = buildConnections(drop.records, odcs, pop);
+    var boq = generateBoq({ odps: odps, odcs: odcs, backbone: backbone, distribution: distribution, drop: drop, poles: poles, homePassed: ctx.homePassed }, options);
+    return { pop: pop, backbone: backbone, distribution: distribution, drop: drop, dropFC: drop.featureCollection, poles: poles, poleFC: poles.featureCollection, connections: connections.edges, connectionFC: connections.featureCollection, boq: boq };
+  }
+
+  // Bangun record detail per-bangunan untuk tabel detected_buildings (Revision 01).
+  // Setiap bangunan: id, lat/lng, centroid, polygon, geojson, area, perimeter,
+  // kategori, confidence, status. Titik (mock) memakai estimasi area/perimeter deterministik.
+  function buildDetectedRecords(buildingsFC, options) {
+    var t = turf();
+    options = options || {};
+    var feats = (buildingsFC && buildingsFC.features) || [];
+    var rand = makePrng((feats.length * 40503) >>> 0 || 7001);
+    var out = [];
+    feats.forEach(function (f, i) {
+      var g = f.geometry; if (!g) return;
+      var centroid = null, area = null, perim = null, polygon = null;
+      var isPoly = g.type === 'Polygon' || g.type === 'MultiPolygon';
+      if (isPoly) {
+        try { centroid = t.centroid(f).geometry.coordinates; } catch (e) {}
+        try { area = Math.round(t.area(f)); } catch (e) {}
+        try {
+          var ring = g.type === 'Polygon' ? g.coordinates[0] : g.coordinates[0][0];
+          perim = Math.round(t.length(t.lineString(ring), { units: 'kilometers' }) * 1000);
+        } catch (e) {}
+        polygon = g;
+      } else if (g.type === 'Point') {
+        centroid = g.coordinates;
+      }
+      if (!centroid) return;
+      var p = f.properties || {};
+      var cat = (p.source === 'mock') ? classifyByChance(rand) : (classifyByTag(p.building || p.type) || classifyByChance(rand));
+      var conf = (p.source === 'mock') ? (0.60 + rand() * 0.25) : (classifyByTag(p.building || p.type) ? 0.90 : 0.70);
+      if (area == null) area = 40 + Math.floor(rand() * 160);          // estimasi utk titik
+      if (perim == null) perim = Math.round(4 * Math.sqrt(area));       // asumsi persegi
+      out.push({
+        building_id: 'BLD-' + pad(i + 1, 6),
+        lat: centroid[1], lng: centroid[0],
+        centroid_lat: centroid[1], centroid_lng: centroid[0],
+        polygon: polygon, geojson: f,
+        area_sqm: area, perimeter_m: perim,
+        category: cat, confidence: Math.round(conf * 100) / 100, status: 'detected',
+      });
+    });
+    return out;
   }
 
   /* =====================================================================
@@ -377,7 +612,7 @@
   if (!PE) PE = window.PlanningEngine = { services: {} };
 
   PE.generators = {
-    version: PHASE2_VERSION,
+    version: R2_VERSION,
     DEFAULTS: DEFAULTS,
     detectAndClassify: detectAndClassify,
     computeHomePassed: computeHomePassed,
@@ -388,9 +623,19 @@
     estimatePoles: estimatePoles,
     generateBoq: generateBoq,
     regenerateLines: regenerateLines,
+    buildDetectedRecords: buildDetectedRecords,
     buildingsToFC: buildingsToFC,
     homePassedFC: homePassedFC,
     pointsToFC: pointsToFC,
+    // Revision 02 — Auto Network Engine
+    buildRoadGraph: buildRoadGraph,
+    routeAlong: routeAlong,
+    autoPlacePop: autoPlacePop,
+    planBackboneRouted: planBackboneRouted,
+    planDistributionRouted: planDistributionRouted,
+    planPolesAlong: planPolesAlong,
+    planDrop: planDrop,
+    buildConnections: buildConnections,
   };
   PE.generate = generate;
 
@@ -401,7 +646,8 @@
     if (PE.services.distribution) PE.services.distribution.plan = function (ctx) { return planDistribution((ctx && ctx.odcs) || [], (ctx && ctx.odps) || [], ctx); };
     if (PE.services.boq) PE.services.boq.compile = function (ctx) { return generateBoq(ctx, ctx); };
     ['odp', 'odc', 'backbone', 'distribution', 'boq'].forEach(function (k) { if (PE.services[k]) PE.services[k].phase2 = 'active'; });
+    ['pole', 'drop'].forEach(function (k) { if (PE.services[k]) PE.services[k].rev02 = 'active'; });
   }
 
-  PE.version = PHASE2_VERSION;
+  PE.version = R2_VERSION;
 })();

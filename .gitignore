@@ -1,0 +1,14 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Backup files created by the app's "Export Database" feature — jangan
+# ikut ter-commit ke repo publik (bisa berisi data pelanggan/proyek nyata).
+backup_*.json
+
+# Local env notes (jika Anda menyimpan catatan kredensial lokal terpisah)
+*.local

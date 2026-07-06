@@ -1,46 +1,75 @@
 /* =========================================================================
    MAPPING AREA — PLANNING ANALYZERS (SMART PLANNING ENGINE — PHASE 1)
    Implementation 02 / Phase 1 — ANALISA AREA.
+   REWRITE v0.3.0 — akurasi bangunan/rumah.
    =========================================================================
    TUJUAN
      Mengisi LOGIKA NYATA untuk tahap ANALISA AREA di atas fondasi
      planning-engine.js (Implementation 01.5). Yang diaktifkan Phase ini:
        - Boundary Analyzer
-       - Building Analyzer  (via provider yang mudah diganti + mock provider)
+       - Building Analyzer  (provider bisa diganti + mock provider fallback)
        - Road Analyzer
        - Coverage Analyzer
      BELUM diaktifkan (tetap stub): ODP/ODC/Backbone/Distribution/Pole/BOQ/
      Proposal (fase generate berikutnya) dan AI.
 
+   PERUBAHAN UTAMA DI REWRITE INI (v0.3.0) — lihat juga CHANGELOG
+     1. PROVIDER DEFAULT diganti dari 'mock' (angka acak) -> 'overpass'
+        (data bangunan & jalan ASLI dari OpenStreetMap). Mock tetap ada
+        HANYA sebagai fallback otomatis bila Overpass gagal total
+        (offline / semua mirror down / timeout).
+     2. Overpass fetch sekarang mencoba BEBERAPA mirror server bergantian
+        (bukan 1 URL saja) dan pakai `out geom;` supaya lebih tahan
+        banting & tidak perlu proses ulang node index secara manual.
+     3. Query building juga menyertakan relation multipolygon (bukan cuma
+        way), supaya kompleks bangunan besar yang dipetakan sebagai
+        relasi di OSM tetap terhitung.
+     4. Klasifikasi rumah/non-rumah diperluas & diselaraskan dengan
+        planning-generators.js (classifyByTag), TERMASUK estimasi jumlah
+        unit hunian untuk bangunan bertingkat/apartemen (building:flats /
+        building:levels) — supaya 1 gedung apartemen tidak dihitung
+        sebagai "1 rumah" saja.
+     5. Menambahkan `data_confidence` pada hasil analisa bangunan: bila
+        kepadatan bangunan hasil OSM jauh di bawah kepadatan wajar utk
+        area terbangun, hasil analisa ditandai "rendah" + catatan supaya
+        planner tahu perlu verifikasi/lengkapi data lapangan — BUKAN
+        mengarang angka supaya "kelihatan" mendekati kondisi lapangan.
+
+     CATATAN JUJUR SOAL AKURASI: tanpa deteksi bangunan berbasis citra
+     satelit (computer vision) yang memang belum ada di codebase ini,
+     akurasi analisa akan selalu bergantung pada KELENGKAPAN data
+     OpenStreetMap di area tersebut. Rewrite ini memaksimalkan apa yang
+     bisa digali dari OSM + memberi sinyal kepercayaan yang jujur,
+     bukan menjamin angka otomatis sama dengan hasil survei lapangan.
+
    SIFAT
-     - Additive murni. File BARU, dimuat lewat <script> setelah
-       planning-engine.js. TIDAK mengubah planning-engine.js, app.js DB, dsb.
-     - Meng-"upgrade" service stub di window.PlanningEngine.services (boundary/
-       building/road/coverage) menjadi implementasi nyata, dan menambah:
-         PlanningEngine.providers   → registry provider yang bisa diganti
-         PlanningEngine.analysis    → analyzer terpisah (dapat dipakai langsung)
-         PlanningEngine.analyze()   → orchestrator pipeline analisa (async)
-     - Vanilla JS, tanpa build. Memakai Turf.js (window.turf) yang sudah dimuat
-       di index.html. Tidak menambah dependency baru.
+     - Additive murni terhadap file lain. File ini sendiri DITULIS ULANG
+       total (bukan tempel-tempel patch) atas permintaan pemilik produk,
+       supaya tidak ada patch yang menumpuk. Dimuat lewat <script> setelah
+       planning-engine.js. TIDAK mengubah planning-engine.js / app.js /
+       skema DB.
+     - Vanilla JS, tanpa build. Memakai Turf.js (window.turf) yang sudah
+       dimuat di index.html. Tidak menambah dependency baru.
 
    CATATAN GEOMETRI
-     Input/-output GeoJSON memakai EPSG:4326 (WGS84). Panjang & luas dihitung
-     dengan Turf (haversine). Coverage % pada tahap analisa didefinisikan
-     sebagai "homepass ratio" = rumah / total bangunan × 100 (rasio bangunan
-     layak layanan) — BUKAN coverage radius ODP (itu tahap generate/Phase 2).
+     Input/-output GeoJSON memakai EPSG:4326 (WGS84). Panjang & luas
+     dihitung dengan Turf (haversine). Coverage % pada tahap analisa
+     didefinisikan sebagai "homepass ratio" = rumah / total bangunan × 100
+     — BUKAN coverage radius ODP (itu tahap generate/Phase 2).
    ========================================================================= */
 (function () {
   'use strict';
 
-  var PHASE1_VERSION = '0.2.0-phase1-analysis';
+  var PHASE1_VERSION = '0.3.0-phase1-analysis-accuracy';
 
   function turf() {
     if (!window.turf) throw new Error('Turf.js belum termuat — analisa area tidak dapat berjalan.');
     return window.turf;
   }
 
-  /* PRNG deterministik (mulberry32) supaya hasil mock stabil antar-run untuk
-     boundary yang sama. */
+  /* PRNG deterministik (mulberry32) — dipakai HANYA oleh mock provider
+     (fallback offline), supaya hasilnya stabil antar-run untuk boundary
+     yang sama. Tidak dipakai sama sekali oleh jalur data asli (overpass). */
   function makePrng(seed) {
     var a = seed >>> 0;
     return function () {
@@ -60,7 +89,7 @@
      PROVIDER REGISTRY (mudah diganti — TIDAK hardcode)
      Kontrak provider:
        Building: async getBuildings(boundaryFeature, options) -> FeatureCollection
-                 (Point/Polygon dengan properties.building | properties.type)
+                 (Polygon/Point dengan properties.building | properties.type)
        Road:     async getRoads(boundaryFeature, options) -> FeatureCollection
                  (LineString dengan properties.highway | properties.type)
      ===================================================================== */
@@ -82,17 +111,17 @@
   }
 
   /* --------------------------------------------------------------------
-     MOCK BUILDING PROVIDER (default, jalan offline)
-     Menyebar titik bangunan pada grid di dalam bbox, disaring ke dalam
-     polygon, dengan tipe (home/non-home) yang deterministik.
+     MOCK BUILDING / ROAD PROVIDER — FALLBACK OFFLINE SAJA.
+     Sejak v0.3.0 provider ini BUKAN default lagi. Hanya dipakai otomatis
+     bila provider 'overpass' gagal total (offline / semua mirror down).
      -------------------------------------------------------------------- */
   var MockBuildingProvider = {
     id: 'mock',
-    title: 'Mock Building Provider',
+    title: 'Mock Building Provider (fallback offline)',
     async getBuildings(boundary, options) {
       var t = turf();
       options = options || {};
-      var bbox = t.bbox(boundary); // [minX,minY,maxX,maxY]
+      var bbox = t.bbox(boundary);
       var areaKm2 = Math.max(t.area(boundary) / 1e6, 0.0001);
       var densityPerKm2 = options.mockDensityPerKm2 || 700;
       var target = Math.min(Math.max(Math.round(areaKm2 * densityPerKm2), 12), options.maxBuildings || 1500);
@@ -121,14 +150,9 @@
     },
   };
 
-  /* --------------------------------------------------------------------
-     MOCK ROAD PROVIDER (default, jalan offline)
-     Membuat grid jalan (beberapa garis vertikal + horizontal) melintasi bbox.
-     Pemotongan ke polygon dilakukan di RoadAnalyzer (bukan di provider).
-     -------------------------------------------------------------------- */
   var MockRoadProvider = {
     id: 'mock',
-    title: 'Mock Road Provider',
+    title: 'Mock Road Provider (fallback offline)',
     async getRoads(boundary, options) {
       var t = turf();
       options = options || {};
@@ -139,12 +163,12 @@
       var rand = makePrng(seedFromBbox(bbox) + 13);
       var feats = [];
       var i, frac, lng, lat;
-      for (i = 1; i <= n; i++) { // vertikal
+      for (i = 1; i <= n; i++) {
         frac = i / (n + 1);
         lng = bbox[0] + frac * (bbox[2] - bbox[0]);
         feats.push(t.lineString([[lng, bbox[1]], [lng, bbox[3]]], { highway: types[Math.floor(rand() * types.length)], type: 'road', source: 'mock' }));
       }
-      for (i = 1; i <= n; i++) { // horizontal
+      for (i = 1; i <= n; i++) {
         frac = i / (n + 1);
         lat = bbox[1] + frac * (bbox[3] - bbox[1]);
         feats.push(t.lineString([[bbox[0], lat], [bbox[2], lat]], { highway: types[Math.floor(rand() * types.length)], type: 'road', source: 'mock' }));
@@ -154,40 +178,83 @@
   };
 
   /* --------------------------------------------------------------------
-     OVERPASS PROVIDERS (opsional, real — BUKAN default)
-     Mengambil bangunan/jalan dari OpenStreetMap via Overpass API dalam bbox,
-     lalu difilter/dipotong ke polygon oleh analyzer. Dibungkus try/catch;
-     bila gagal (offline/limit), analyzer otomatis fallback ke mock.
+     OVERPASS PROVIDERS (default sejak v0.3.0) — data ASLI dari
+     OpenStreetMap. Mencoba beberapa mirror server bergantian supaya
+     tahan banting terhadap rate-limit/downtime satu server, dan memakai
+     `out geom;` supaya setiap way/relation membawa koordinatnya sendiri
+     (tidak perlu index node manual -> lebih ringkas & lebih andal untuk
+     relation/multipolygon).
      -------------------------------------------------------------------- */
-  var OVERPASS_URL = 'https://overpass-api.de/api/interpreter';
+  var OVERPASS_MIRRORS = [
+    'https://overpass-api.de/api/interpreter',
+    'https://overpass.kumi.systems/api/interpreter',
+    'https://overpass.openstreetmap.ru/api/interpreter',
+  ];
 
-  async function overpassFetch(query, timeoutMs) {
+  async function overpassFetchOnce(url, query, timeoutMs) {
     var ctrl = new AbortController();
-    var to = setTimeout(function () { ctrl.abort(); }, timeoutMs || 25000);
+    var to = setTimeout(function () { ctrl.abort(); }, timeoutMs || 35000);
     try {
-      var res = await fetch(OVERPASS_URL, { method: 'POST', body: 'data=' + encodeURIComponent(query), signal: ctrl.signal });
-      if (!res.ok) throw new Error('Overpass HTTP ' + res.status);
+      var res = await fetch(url, { method: 'POST', body: 'data=' + encodeURIComponent(query), signal: ctrl.signal });
+      if (!res.ok) throw new Error('Overpass HTTP ' + res.status + ' (' + url + ')');
       return await res.json();
     } finally { clearTimeout(to); }
   }
 
-  // Konversi elemen Overpass (way) -> koordinat [lng,lat][] memakai peta node.
-  function overpassWaysToGeoJSON(json, asPolygon) {
+  // Coba tiap mirror satu-persatu; lempar error terakhir bila semua gagal.
+  async function overpassFetch(query, timeoutMs) {
+    var lastErr = null;
+    for (var i = 0; i < OVERPASS_MIRRORS.length; i++) {
+      try {
+        return await overpassFetchOnce(OVERPASS_MIRRORS[i], query, timeoutMs);
+      } catch (err) {
+        lastErr = err;
+        console.warn('[Analyzers] mirror Overpass gagal (' + OVERPASS_MIRRORS[i] + '): ' + err.message);
+      }
+    }
+    throw lastErr || new Error('Semua mirror Overpass gagal dihubungi.');
+  }
+
+  function ringFromGeomArray(geomArr) {
+    if (!geomArr || geomArr.length < 3) return null;
+    var coords = geomArr.map(function (p) { return [p.lon, p.lat]; });
+    var first = coords[0], last = coords[coords.length - 1];
+    if (first[0] !== last[0] || first[1] !== last[1]) coords.push(first);
+    return coords.length >= 4 ? coords : null;
+  }
+
+  // Parse hasil `out geom;` (way & relation multipolygon) -> FeatureCollection
+  // Polygon (bangunan) atau LineString (jalan), sesuai `asPolygon`.
+  function overpassGeomToGeoJSON(json, asPolygon) {
     var t = turf();
-    var nodes = {};
-    (json.elements || []).forEach(function (e) { if (e.type === 'node') nodes[e.id] = [e.lon, e.lat]; });
     var feats = [];
     (json.elements || []).forEach(function (e) {
-      if (e.type !== 'way' || !e.nodes) return;
-      var coords = e.nodes.map(function (id) { return nodes[id]; }).filter(Boolean);
-      if (coords.length < 2) return;
       var props = e.tags || {};
-      if (asPolygon) {
-        if (coords.length < 4) return;
-        if (coords[0][0] !== coords[coords.length - 1][0] || coords[0][1] !== coords[coords.length - 1][1]) coords.push(coords[0]);
-        try { feats.push(t.polygon([coords], props)); } catch (err) {}
-      } else {
-        try { feats.push(t.lineString(coords, props)); } catch (err) {}
+      if (e.type === 'way' && e.geometry) {
+        if (asPolygon) {
+          var ring = ringFromGeomArray(e.geometry);
+          if (!ring) return;
+          try { feats.push(t.polygon([ring], props)); } catch (err) {}
+        } else {
+          var coords = e.geometry.map(function (p) { return [p.lon, p.lat]; });
+          if (coords.length < 2) return;
+          try { feats.push(t.lineString(coords, props)); } catch (err) {}
+        }
+      } else if (e.type === 'relation' && asPolygon && e.members) {
+        // Best-effort multipolygon: gabungkan tiap member "outer" yang
+        // sudah berbentuk ring tertutup sendiri (kasus paling umum di OSM
+        // untuk kompleks bangunan). Member outer yang terpotong jadi
+        // beberapa way (butuh penyambungan ring penuh) dilewati saja demi
+        // keamanan, ketimbang menghasilkan polygon yang salah bentuk.
+        var outerRings = [];
+        e.members.forEach(function (m) {
+          if (m.role !== 'outer' || !m.geometry) return;
+          var r = ringFromGeomArray(m.geometry);
+          if (r) outerRings.push(r);
+        });
+        outerRings.forEach(function (r) {
+          try { feats.push(t.polygon([r], props)); } catch (err) {}
+        });
       }
     });
     return t.featureCollection(feats);
@@ -195,43 +262,46 @@
 
   var OverpassBuildingProvider = {
     id: 'overpass',
-    title: 'Overpass (OSM) Building Provider',
+    title: 'Overpass (OpenStreetMap) — Bangunan Asli',
     async getBuildings(boundary, options) {
       var t = turf();
       var b = t.bbox(boundary); // minX,minY,maxX,maxY -> Overpass: south,west,north,east
       var bboxStr = b[1] + ',' + b[0] + ',' + b[3] + ',' + b[2];
-      var q = '[out:json][timeout:25];(way["building"](' + bboxStr + '););out body;>;out skel qt;';
+      var q = '[out:json][timeout:40];(' +
+        'way["building"](' + bboxStr + ');' +
+        'relation["building"]["type"="multipolygon"](' + bboxStr + ');' +
+        ');out geom;';
       var json = await overpassFetch(q, options && options.timeoutMs);
-      return overpassWaysToGeoJSON(json, true);
+      return overpassGeomToGeoJSON(json, true);
     },
   };
 
   var OverpassRoadProvider = {
     id: 'overpass',
-    title: 'Overpass (OSM) Road Provider',
+    title: 'Overpass (OpenStreetMap) — Jalan Asli',
     async getRoads(boundary, options) {
       var t = turf();
       var b = t.bbox(boundary);
       var bboxStr = b[1] + ',' + b[0] + ',' + b[3] + ',' + b[2];
-      var q = '[out:json][timeout:25];(way["highway"](' + bboxStr + '););out body;>;out skel qt;';
+      var q = '[out:json][timeout:40];(way["highway"](' + bboxStr + '););out geom;';
       var json = await overpassFetch(q, options && options.timeoutMs);
-      return overpassWaysToGeoJSON(json, false);
+      return overpassGeomToGeoJSON(json, false);
     },
   };
 
-  var buildingProviders = providerRegistry('building', 'mock')
+  // DEFAULT sejak v0.3.0: 'overpass' (data asli), BUKAN 'mock' lagi.
+  // Mock tetap terdaftar sebagai fallback otomatis bila overpass gagal
+  // (lihat analyzeBuildings/analyzeRoads).
+  var buildingProviders = providerRegistry('building', 'overpass')
     .register('mock', MockBuildingProvider)
     .register('overpass', OverpassBuildingProvider);
-  var roadProviders = providerRegistry('road', 'mock')
+  var roadProviders = providerRegistry('road', 'overpass')
     .register('mock', MockRoadProvider)
     .register('overpass', OverpassRoadProvider);
 
   /* =====================================================================
      UTIL GEOMETRI
      ===================================================================== */
-  // Normalisasi input boundary (FeatureCollection | Feature | Geometry) ->
-  // satu Feature Polygon/MultiPolygon. Bila banyak polygon, gabung jadi
-  // MultiPolygon (tanpa union, agar ringan & stabil).
   function normalizeBoundary(input) {
     var t = turf();
     if (!input) return null;
@@ -243,7 +313,7 @@
     }
     if (input.type === 'FeatureCollection') input.features.forEach(function (f) { pushGeom(f.geometry); });
     else if (input.type === 'Feature') pushGeom(input.geometry);
-    else pushGeom(input); // raw geometry
+    else pushGeom(input);
     if (!polys.length) return null;
     if (polys.length === 1) return t.polygon(polys[0]);
     return t.multiPolygon(polys);
@@ -267,12 +337,10 @@
     return n;
   }
 
-  // Potong sebuah LineString ke dalam polygon; kembalikan segmen-segmen yang
-  // berada di dalam boundary.
   function clipLineToPolygon(line, boundary) {
     var t = turf();
     try {
-      var split = t.lineSplit(line, boundary); // FeatureCollection LineString
+      var split = t.lineSplit(line, boundary);
       var segs = [];
       var feats = (split && split.features) ? split.features : [line];
       feats.forEach(function (seg) {
@@ -319,12 +387,55 @@
   /* =====================================================================
      2) BUILDING ANALYZER
      ===================================================================== */
+  // Tag OSM yang jelas BUKAN rumah tinggal (diselaraskan dengan
+  // planning-generators.js classifyByTag, supaya konsisten Fase 1 & 2).
+  var NON_HOME_TAGS = [
+    'commercial', 'retail', 'shop', 'kiosk', 'supermarket', 'industrial',
+    'warehouse', 'office', 'school', 'hospital', 'church', 'mosque',
+    'public', 'civic', 'hotel', 'university', 'government', 'garage',
+    'garages', 'shed', 'roof', 'hut', 'greenhouse', 'construction',
+    'ruins', 'service', 'parking', 'toilets', 'transportation',
+  ];
+  // Tag yang JELAS rumah tinggal / hunian.
+  var HOME_TAGS = [
+    'home', 'yes', 'house', 'residential', 'apartments', 'detached',
+    'terrace', 'semidetached_house', 'bungalow', 'dormitory',
+    'residential_block', 'houseboat', 'static_caravan', 'hut',
+  ];
+  // 'hut' sengaja tidak dobel — override: kalau ada di kedua daftar,
+  // NON_HOME_TAGS diprioritaskan di bawah ini untuk kasus ambigu.
+
   function classifyHome(props) {
     props = props || {};
     var v = String(props.type || props.building || '').toLowerCase();
-    var homeTypes = ['home', 'yes', 'house', 'residential', 'apartments', 'detached', 'terrace', 'semidetached_house', 'bungalow', 'dormitory'];
-    return homeTypes.indexOf(v) !== -1;
+    if (NON_HOME_TAGS.indexOf(v) !== -1) return false;
+    if (HOME_TAGS.indexOf(v) !== -1) return true;
+    // Tag tidak dikenali sama sekali (banyak terjadi utk building=yes
+    // tanpa tag lain, atau data OSM yang minim) — asumsikan rumah tinggal
+    // HANYA bila tidak ada indikasi komersial/fasilitas dari tag lain
+    // (shop/office/amenity), karena mayoritas gedung di area permukiman
+    // yang tidak diberi tag khusus memang rumah warga.
+    if (!props.shop && !props.office && !props.amenity) return true;
+    return false;
   }
+
+  // Estimasi jumlah unit hunian dalam SATU bangunan bertingkat/apartemen,
+  // supaya gedung apartemen tidak dihitung "1 rumah" saja. Kembalikan 1
+  // untuk rumah tapak biasa (paling umum).
+  function estimateDwellingUnits(props) {
+    props = props || {};
+    var flats = parseInt(props['building:flats'], 10);
+    if (flats > 0) return flats;
+    var v = String(props.type || props.building || '').toLowerCase();
+    if (v === 'apartments' || v === 'residential_block' || v === 'dormitory') {
+      var levels = parseInt(props['building:levels'], 10);
+      var unitsPerLevel = 4; // asumsi konservatif tanpa data building:flats
+      if (levels > 0) return Math.max(1, Math.round(levels * unitsPerLevel));
+      return 8; // fallback kasar bila levels juga tidak ada
+    }
+    return 1;
+  }
+
   function featureCentroid(f) {
     var t = turf();
     try { return t.centroid(f); } catch (e) {
@@ -332,6 +443,13 @@
       return null;
     }
   }
+
+  // Ambang kepadatan bangunan (per km²) di bawah mana hasil analisa
+  // ditandai "confidence rendah" — nilai default dipilih longgar (area
+  // permukiman padat Indonesia umumnya jauh di atas ini), bisa dioverride
+  // lewat options.minExpectedDensityPerKm2.
+  var DEFAULT_MIN_EXPECTED_DENSITY = 400;
+
   async function analyzeBuildings(boundary, options) {
     var t = turf();
     options = options || {};
@@ -339,12 +457,13 @@
     var providerName = registry.currentName();
     var provider = registry.current();
     var fc;
+    var usedFallback = false;
     try {
       fc = await provider.getBuildings(boundary, options);
     } catch (err) {
-      // Fallback aman ke mock bila provider real gagal (mis. offline).
       console.warn('[Analyzers] provider bangunan "' + providerName + '" gagal (' + err.message + '), fallback ke mock.');
       providerName = 'mock';
+      usedFallback = true;
       fc = await MockBuildingProvider.getBuildings(boundary, options);
     }
     var inside = [];
@@ -352,16 +471,42 @@
       var c = featureCentroid(f);
       if (c && t.booleanPointInPolygon(c, boundary)) inside.push(f);
     });
-    var homes = 0, nonHomes = 0;
-    inside.forEach(function (f) { if (classifyHome(f.properties)) homes++; else nonHomes++; });
+
+    var homes = 0, nonHomes = 0, dwellingUnits = 0;
+    inside.forEach(function (f) {
+      var isHome = classifyHome(f.properties);
+      if (isHome) { homes++; dwellingUnits += estimateDwellingUnits(f.properties); }
+      else nonHomes++;
+    });
+
     var areaKm2 = Math.max(t.area(boundary) / 1e6, 1e-6);
+    var densityPerKm2 = Math.round((inside.length / areaKm2) * 100) / 100;
+
+    var minExpected = options.minExpectedDensityPerKm2 || DEFAULT_MIN_EXPECTED_DENSITY;
+    var confidence = 'baik';
+    var confidenceNote = null;
+    if (usedFallback) {
+      confidence = 'rendah';
+      confidenceNote = 'Data sintetis (mock) — semua mirror Overpass gagal dihubungi. Angka HANYA perkiraan kasar, bukan data lapangan asli.';
+    } else if (densityPerKm2 < minExpected) {
+      confidence = 'rendah';
+      confidenceNote = 'Kepadatan bangunan dari OpenStreetMap (' + densityPerKm2 + '/km²) jauh di bawah ambang wajar area terbangun (' + minExpected + '/km²). Kemungkinan data OSM di area ini belum lengkap — disarankan verifikasi manual dari citra satelit atau survei lapangan, jangan jadikan angka ini sebagai acuan tunggal.';
+    }
+
     return {
       provider: providerName,
       featureCollection: t.featureCollection(inside),
       total: inside.length,
       homes: homes,
       nonHomes: nonHomes,
-      density_per_km2: Math.round((inside.length / areaKm2) * 100) / 100,
+      // Perkiraan unit hunian (memperhitungkan apartemen/bangunan
+      // bertingkat) — bisa lebih besar dari `homes` bila ada bangunan
+      // multi-unit di area tsb. Dipakai sebagai info tambahan, TIDAK
+      // menggantikan `homes` pada field lama supaya kompatibel.
+      estimated_dwelling_units: dwellingUnits,
+      density_per_km2: densityPerKm2,
+      data_confidence: confidence,
+      data_confidence_note: confidenceNote,
     };
   }
 
@@ -399,7 +544,6 @@
     var typeSet = {};
     clipped.forEach(function (s) { var ty = (s.properties && (s.properties.highway || s.properties.type)) || 'unknown'; typeSet[ty] = (typeSet[ty] || 0) + 1; });
 
-    // Intersections: hitung titik potong antar-segmen (dibatasi untuk performa).
     var cap = Math.min(clipped.length, 220);
     var interKeys = {};
     for (var i = 0; i < cap; i++) {
@@ -435,17 +579,19 @@
     var homeCount = buildingResult.homes;
     var nonHomeCount = buildingResult.nonHomes;
     var density = Math.round((buildingCount / areaKm2) * 100) / 100;
-    // Coverage % (tahap analisa) = homepass ratio = rumah / total bangunan.
     var coveragePercent = buildingCount > 0 ? Math.round((homeCount / buildingCount) * 10000) / 100 : 0;
     return {
       building_count: buildingCount,
       home_count: homeCount,
       non_home_count: nonHomeCount,
+      estimated_dwelling_units: buildingResult.estimated_dwelling_units,
       area_sqm: Math.round(areaSqm),
       road_length_m: roadResult.total_length_m,
       density_per_km2: density,
       coverage_percent: coveragePercent,
       coverage_definition: 'homepass ratio (rumah / total bangunan)',
+      data_confidence: buildingResult.data_confidence,
+      data_confidence_note: buildingResult.data_confidence_note,
     };
   }
 
@@ -476,7 +622,6 @@
      ===================================================================== */
   var PE = window.PlanningEngine;
   if (!PE) {
-    // Defensif: bila planning-engine.js belum termuat, sediakan namespace minimal.
     PE = window.PlanningEngine = { version: PHASE1_VERSION, services: {}, list: [], run: function () { return { status: 'stub' }; }, describe: function () { return { services: [] }; } };
   }
 
@@ -491,7 +636,6 @@
   };
   PE.analyze = analyze;
 
-  // Upgrade 4 service stub agar konsisten memanggil implementasi nyata.
   if (PE.services) {
     if (PE.services.boundary) {
       PE.services.boundary.resolveBoundary = function (input) {
@@ -502,7 +646,6 @@
     if (PE.services.building) PE.services.building.detectBuildings = function (ctx) { return analyzeBuildings((ctx && (ctx.boundary || ctx.feature)) || ctx, ctx && ctx.options); };
     if (PE.services.road) PE.services.road.extractRoads = function (ctx) { return analyzeRoads((ctx && (ctx.boundary || ctx.feature)) || ctx, ctx && ctx.options); };
     if (PE.services.coverage) PE.services.coverage.computeCoverage = function (ctx) { return analyzeCoverage(ctx.boundary, ctx.buildings, ctx.roads); };
-    // Tandai status Phase 1 aktif untuk 4 service ini (dipakai UI).
     ['boundary', 'building', 'road', 'coverage'].forEach(function (k) { if (PE.services[k]) PE.services[k].phase1 = 'active'; });
   }
 

@@ -169,6 +169,9 @@ h1, h2, h3, h4 { margin: 0; font-weight: 600; color: var(--color-text); }
 .topbar {
   height: var(--topbar-height); flex-shrink: 0; display: flex; align-items: center; gap: 14px;
   padding: 0 18px; background: var(--color-surface); border-bottom: 1px solid var(--color-border);
+  /* FIX #3: beri stacking context sendiri, DI ATAS .sidebar-backdrop (190),
+     supaya topbar tidak ikut tertutup/dimmed saat sidebar mobile dibuka. */
+  position: relative; z-index: 195;
 }
 .icon-btn {
   width: 36px; height: 36px; border-radius: 50%; border: none; background: transparent;
@@ -204,6 +207,10 @@ h1, h2, h3, h4 { margin: 0; font-weight: 600; color: var(--color-text); }
   display: flex; align-items: center; gap: 10px; padding: 10px 20px;
   border-bottom: 1px solid var(--color-border); background: var(--color-surface); flex-wrap: wrap;
   min-height: 0;
+  /* FIX #3: sama seperti .topbar — tetap di atas .sidebar-backdrop supaya
+     tombol "Import Data / Gambar Polygon / Analisa Area" dkk tidak ikut
+     tertutup saat sidebar mobile sedang terbuka. */
+  position: relative; z-index: 195;
 }
 .page-toolbar:empty { display: none; }
 

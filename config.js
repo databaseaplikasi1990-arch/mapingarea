@@ -8,11 +8,11 @@
    dengan menelusuri SETIAP pemakaian `CFG.xxx` di app.js/planning-*.js,
    supaya aplikasi bisa berjalan lengkap. Lihat FINAL_AUDIT_REPORT.md §0.
 
-   WAJIB ANDA ISI SEBELUM DEPLOY:
-     - SUPABASE_URL dan SUPABASE_ANON_KEY (baris di bawah, isi placeholder
-       "GANTI_DENGAN_..." dengan nilai project Supabase Anda sendiri).
-       PENTING: pakai ANON key, JANGAN PERNAH service_role key di sini
-       (file ini dikirim ke browser publik).
+   KREDENSIAL SUPABASE: sudah diisi di bawah (project ykkgqojoarfwbiqtqvlr),
+   memakai anon key (dicek: payload JWT berisi "role":"anon", BUKAN
+   service_role — aman ditaruh di file publik/GitHub). Tinggal upload,
+   TIDAK perlu isi ulang. Kalau nanti Anda pindah/reset project Supabase,
+   ganti 2 baris SUPABASE_URL/SUPABASE_ANON_KEY di bawah dengan yang baru.
 
    Jika Anda punya config.js versi asli yang berbeda (mis. NAV_GROUPS dengan
    urutan/label lain), SILAKAN timpa file ini dengan versi asli Anda —
@@ -23,9 +23,9 @@
   'use strict';
 
   window.CFG = {
-    // ---------- Koneksi Supabase (WAJIB DIISI) ----------
-    SUPABASE_URL: 'https://ykkgqojoarfwbiqtqvlr.supabase.co'
-    SUPABASE_ANON_KEY: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inlra2dxb2pvYXJmd2JpcXRxdmxyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODMxNjUxMjMsImV4cCI6MjA5ODc0MTEyM30.0iv3zHxYtqEEBlajAYodOr82fJZRwnPueM0EaO4WEMY
+    // ---------- Koneksi Supabase ----------
+    SUPABASE_URL: 'https://ykkgqojoarfwbiqtqvlr.supabase.co',
+    SUPABASE_ANON_KEY: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inlra2dxb2pvYXJmd2JpcXRxdmxyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODMxNjUxMjMsImV4cCI6MjA5ODc0MTEyM30.0iv3zHxYtqEEBlajAYodOr82fJZRwnPueM0EaO4WEMY',
 
     // ---------- Umum ----------
     VERSION: '1.0.0',

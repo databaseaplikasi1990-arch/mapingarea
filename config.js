@@ -24,8 +24,8 @@
 
   window.CFG = {
     // ---------- Koneksi Supabase (WAJIB DIISI) ----------
-    SUPABASE_URL: 'GANTI_DENGAN_URL_SUPABASE_ANDA',       // contoh: 'https://xxxxxxxx.supabase.co'
-    SUPABASE_ANON_KEY: 'GANTI_DENGAN_ANON_KEY_SUPABASE_ANDA',
+    SUPABASE_URL: 'https://ykkgqojoarfwbiqtqvlr.supabase.co'
+    SUPABASE_ANON_KEY: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inlra2dxb2pvYXJmd2JpcXRxdmxyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODMxNjUxMjMsImV4cCI6MjA5ODc0MTEyM30.0iv3zHxYtqEEBlajAYodOr82fJZRwnPueM0EaO4WEMY
 
     // ---------- Umum ----------
     VERSION: '1.0.0',

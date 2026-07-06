@@ -27,6 +27,49 @@
 </div>
 
 <!-- ======================================================= -->
+<!-- PENANGKAP ERROR TAMPIL DI LAYAR (untuk debug tanpa DevTools/laptop). -->
+<!-- Diletakkan SEPALING AWAL supaya menangkap error load script apa pun. -->
+<!-- Aman dihapus/diabaikan setelah aplikasi terbukti jalan normal.       -->
+<!-- ======================================================= -->
+<script>
+(function () {
+  var shown = false;
+  function showError(msg, src, line, col) {
+    if (shown) return; shown = true;
+    var box = document.createElement('div');
+    box.style.cssText = 'position:fixed;inset:0;z-index:99999;background:#1a1f2e;color:#fff;' +
+      'font-family:monospace;font-size:13px;padding:20px;overflow:auto;white-space:pre-wrap;line-height:1.6;';
+    box.textContent = '❌ APLIKASI GAGAL DIMUAT\n\n' +
+      'Pesan: ' + msg + '\n' +
+      (src ? ('File: ' + src + (line ? (' (baris ' + line + (col ? (':' + col) : '') + ')') : '') + '\n') : '') +
+      '\nScreenshot layar ini dan kirim ke developer untuk diagnosis.';
+    document.body.innerHTML = '';
+    document.body.appendChild(box);
+  }
+  window.addEventListener('error', function (e) {
+    // Error load <script src="..."> (404/gagal fetch) tidak selalu punya e.message yang jelas.
+    if (e.target && (e.target.tagName === 'SCRIPT' || e.target.tagName === 'LINK')) {
+      showError('Gagal memuat file: ' + (e.target.src || e.target.href) + ' (cek nama file/typo/404)', e.target.src || e.target.href);
+    } else {
+      showError(e.message || 'Unknown error', e.filename, e.lineno, e.colno);
+    }
+  }, true);
+  window.addEventListener('unhandledrejection', function (e) {
+    showError('Promise gagal: ' + (e.reason && e.reason.message ? e.reason.message : e.reason));
+  });
+  // Jaring pengaman: kalau splash MASIH terlihat setelah 10 detik tanpa error
+  // tertangkap sama sekali, kemungkinan macet diam (mis. request jaringan
+  // yang tidak pernah selesai) — tampilkan info alih-alih diam selamanya.
+  setTimeout(function () {
+    var splash = document.getElementById('app-splash');
+    if (splash && splash.offsetParent !== null && !shown) {
+      showError('Aplikasi macet lebih dari 10 detik TANPA error terlacak. Kemungkinan koneksi ke Supabase lambat/gagal, atau ada script yang belum termuat. Cek koneksi internet & coba refresh.');
+    }
+  }, 10000);
+})();
+</script>
+
+<!-- ======================================================= -->
 <!-- AUTH SCREEN (Login)                                      -->
 <!-- ======================================================= -->
 <div id="auth-screen" class="auth-screen hidden">

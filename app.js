@@ -29,6 +29,7 @@
     map: null,
     heatMap: null,
     mapLayers: {},           // key -> L.LayerGroup
+    currentMapProjectId: null, // project aktif di halaman Mapping — bertahan selama sesi (pindah menu tidak reset).
     autosaveTimer: null,
     realtimeChannels: [],
   };
@@ -290,14 +291,14 @@
     container.innerHTML = '';
     const grid = el('div', { class: 'stat-grid' });
     const statDefs = [
-      { key: 'totalProject', label: 'Total Project', icon: 'fa-folder' },
-      { key: 'totalArea', label: 'Total Area', icon: 'fa-draw-polygon' },
-      { key: 'totalRumah', label: 'Total Rumah', icon: 'fa-house' },
-      { key: 'totalTiang', label: 'Total Tiang', icon: 'fa-tower-cell' },
-      { key: 'totalOdc', label: 'Total ODC', icon: 'fa-server' },
-      { key: 'totalOdp', label: 'Total ODP', icon: 'fa-diagram-project' },
-      { key: 'coveragePercent', label: 'Coverage', icon: 'fa-wifi', suffix: '%' },
-      { key: 'surveyProgressPercent', label: 'Progress Survey', icon: 'fa-clipboard-check', suffix: '%' },
+      { key: 'totalProject', label: 'Total Project', icon: 'fa-folder', route: 'project' },
+      { key: 'totalArea', label: 'Total Area', icon: 'fa-draw-polygon', route: 'areas' },
+      { key: 'totalRumah', label: 'Total Rumah', icon: 'fa-house', route: 'homes' },
+      { key: 'totalTiang', label: 'Total Tiang', icon: 'fa-tower-cell', route: 'poles' },
+      { key: 'totalOdc', label: 'Total ODC', icon: 'fa-server', route: 'odc' },
+      { key: 'totalOdp', label: 'Total ODP', icon: 'fa-diagram-project', route: 'odp' },
+      { key: 'coveragePercent', label: 'Coverage', icon: 'fa-wifi', suffix: '%', route: 'coverage' },
+      { key: 'surveyProgressPercent', label: 'Progress Survey', icon: 'fa-clipboard-check', suffix: '%', route: 'validation' },
     ];
     const cardsByKey = {};
     statDefs.forEach((s) => {
@@ -306,10 +307,10 @@
         el('div', { class: 'stat-icon' }, [el('i', { class: `fa-solid ${s.icon}` })]),
         el('div', {}, [valueEl, el('div', { class: 'stat-label' }, [s.label])]),
       ]);
-      if (s.key === 'totalProject') {
+      if (s.route) {
         card.style.cursor = 'pointer';
-        card.title = 'Buka daftar project';
-        card.addEventListener('click', () => { location.hash = '#/project'; });
+        card.title = 'Buka menu ' + s.label;
+        card.addEventListener('click', () => { location.hash = '#/' + s.route; });
       }
       cardsByKey[s.key] = { valueEl, suffix: s.suffix || '' };
       grid.appendChild(card);
@@ -393,8 +394,25 @@
   /* ================= [MAPPING] PETA + IMPORT ================= */
   registerModule('mapping', async function renderMapping(container) {
     container.innerHTML = '';
+    // Dropdown pilih Project — layer import akan tersimpan permanen & terikat ke project ini,
+    // sehingga tidak hilang lagi saat pindah menu (Migration 013: map_import_layers).
+    const projectSelect = el('select', { class: 'text-input', style: 'max-width:220px;' }, [
+      el('option', { value: '' }, ['— Pilih Project (agar import tersimpan) —']),
+    ]);
+    try {
+      const { data } = await App.supabase.from('projects').select('id,name').order('created_at', { ascending: false }).limit(500);
+      (data || []).forEach((p) => projectSelect.appendChild(el('option', { value: p.id, selected: App.currentMapProjectId === p.id ? 'selected' : null }, [p.name])));
+    } catch (e) { /* projects belum ada */ }
+    projectSelect.addEventListener('change', async (e) => {
+      App.currentMapProjectId = e.target.value || null;
+      clearAllMapLayers();
+      if (App.currentMapProjectId) await loadSavedMapLayers(App.currentMapProjectId);
+      toast(App.currentMapProjectId ? 'Project dipilih — import berikutnya otomatis tersimpan & dimuat ulang di project ini.' : 'Tidak ada project dipilih — import hanya sementara (hilang saat pindah menu).', 'info', 5000);
+    });
+
     // Toolbar halaman
     $('#page-toolbar').appendChild(el('div', { class: 'table-toolbar' }, [
+      projectSelect,
       el('button', { class: 'btn btn-secondary btn-sm', onclick: () => openImportDialog() }, [
         el('i', { class: 'fa-solid fa-file-import' }), ' Import Data',
       ]),
@@ -427,10 +445,29 @@
     container.appendChild(layout);
 
     initMap(mapWrap);
+    if (App.currentMapProjectId) await loadSavedMapLayers(App.currentMapProjectId);
   }, function destroyMapping() {
     if (App.map) { App.map.remove(); App.map = null; }
     App.mapLayers = {};
   });
+
+  // Hapus semua layer dari peta (tanpa hapus dari DB) — dipakai saat ganti project.
+  function clearAllMapLayers() {
+    Object.keys(App.mapLayers).forEach((key) => { try { App.map.removeLayer(App.mapLayers[key]); } catch (e) {} delete App.mapLayers[key]; });
+    refreshLayerList();
+  }
+
+  // Muat ulang layer yang pernah diimpor & tersimpan untuk project ini (Migration 013).
+  async function loadSavedMapLayers(projectId) {
+    try {
+      const { data, error } = await App.supabase.from('map_import_layers').select('*').eq('project_id', projectId).order('created_at', { ascending: true });
+      if (error) throw error;
+      (data || []).forEach((row) => addGeoJsonLayer(row.name, row.geojson, { dbId: row.id, color: row.color, skipSave: true }));
+      if (data && data.length) toast(data.length + ' layer tersimpan dimuat ulang untuk project ini.', 'success', 3500);
+    } catch (e) {
+      // migration_013_map_import_layers.sql belum dijalankan — diamkan, fallback ke perilaku lama (memori saja).
+    }
+  }
 
   function initMap(mapWrap) {
     App.map = L.map(mapWrap, { zoomControl: false }).setView(CFG.DEFAULT_CENTER, CFG.DEFAULT_ZOOM);
@@ -651,9 +688,10 @@
     }
   }
 
-  function addGeoJsonLayer(name, geojson) {
+  function addGeoJsonLayer(name, geojson, opts) {
+    opts = opts || {};
     if (!App.map) return;
-    const color = randomLayerColor();
+    const color = opts.color || randomLayerColor();
     const layer = L.geoJSON(geojson, {
       style: { color, weight: 2, fillOpacity: 0.15 },
       pointToLayer: (feature, latlng) => L.circleMarker(latlng, { radius: 6, color, fillColor: color, fillOpacity: 0.8 }),
@@ -668,9 +706,34 @@
     const clusterGroup = L.markerClusterGroup ? L.markerClusterGroup() : L.layerGroup();
     layer.eachLayer((l) => { if (l instanceof L.CircleMarker || l instanceof L.Marker) clusterGroup.addLayer(l); });
     layer.addTo(App.map);
+    layer._dbId = opts.dbId || null;
     App.mapLayers[name + '_' + Date.now()] = layer;
     try { App.map.fitBounds(layer.getBounds(), { maxZoom: 17 }); } catch (e) {}
     refreshLayerList();
+
+    // Simpan permanen ke project aktif (Migration 013) supaya tidak hilang saat
+    // pindah menu. Kalau belum pilih project / migration belum jalan, layer
+    // tetap tampil (perilaku lama) tapi cuma sementara di memori browser.
+    if (!opts.skipSave) {
+      if (!App.currentMapProjectId) {
+        toast('Layer "' + name + '" belum tersimpan permanen — pilih Project dulu di toolbar Mapping.', 'warning', 6000);
+      } else {
+        (async () => {
+          try {
+            const featureCount = (geojson && geojson.features) ? geojson.features.length : 1;
+            const { data, error } = await App.supabase.from('map_import_layers').insert({
+              project_id: App.currentMapProjectId, name, color, geojson, feature_count: featureCount,
+              planner: (App.profile && App.profile.full_name) || 'Pengguna',
+              created_by: (App.session && App.session.user && App.session.user.id) || null,
+            }).select('id').single();
+            if (error) throw error;
+            layer._dbId = data.id;
+          } catch (e) {
+            toast('Layer tampil tapi GAGAL tersimpan permanen (jalankan migration_013_map_import_layers.sql).', 'warning', 6000);
+          }
+        })();
+      }
+    }
   }
 
   function randomLayerColor() {
@@ -689,15 +752,19 @@
     }
     keys.forEach((key) => {
       const name = key.split('_')[0];
+      const savedBadge = App.mapLayers[key]._dbId ? el('i', { class: 'fa-solid fa-cloud', style: 'font-size:10px;color:var(--color-success);margin-left:4px;', title: 'Tersimpan permanen' }) : el('i', { class: 'fa-solid fa-triangle-exclamation', style: 'font-size:10px;color:var(--color-warning);margin-left:4px;', title: 'Belum tersimpan — hilang saat pindah menu' });
       const item = el('div', { class: 'layer-item' }, [
         el('input', { type: 'checkbox', checked: 'checked', onchange: (e) => {
           const layer = App.mapLayers[key];
           if (e.target.checked) App.map.addLayer(layer); else App.map.removeLayer(layer);
         } }),
         el('span', {}, [name]),
-        el('button', { class: 'icon-btn btn-icon-only', style: 'margin-left:auto;width:26px;height:26px;', onclick: () => {
-          App.map.removeLayer(App.mapLayers[key]);
+        savedBadge,
+        el('button', { class: 'icon-btn btn-icon-only', style: 'margin-left:auto;width:26px;height:26px;', onclick: async () => {
+          const layer = App.mapLayers[key];
+          App.map.removeLayer(layer);
           delete App.mapLayers[key];
+          if (layer._dbId) { try { await App.supabase.from('map_import_layers').delete().eq('id', layer._dbId); } catch (e) {} }
           refreshLayerList();
         } }, [el('i', { class: 'fa-solid fa-trash', style: 'font-size:11px' })]),
       ]);
@@ -2054,10 +2121,15 @@
   function injectSmartPlanningNav() {
     const nav = $('#sidebar-nav');
     if (!nav) return;
-    // Jangan duplikasi bila route ini sudah punya nav-item (mis. dari config.js).
-    if (nav.querySelector('[data-route="smart-planning"]')) return;
+    // BUGFIX: sebelumnya baris ini `return` total kalau menu "smart-planning" sudah
+    // ada dari config.js (NAV_GROUPS) — akibatnya SELURUH grup "Smart FTTH" di bawah
+    // (Planning Wizard, Planning Summary, Detected Buildings, dst) tidak pernah
+    // ditambahkan. Sekarang hanya melewati pembuatan item disabled duplikat ini,
+    // proses lanjut ke item-item lain di bawah (masing-masing sudah ada guard sendiri).
+    const smartPlanningAlreadyExists = !!nav.querySelector('[data-route="smart-planning"]');
+    if (nav.querySelector('[data-route="planning-wizard"]') && smartPlanningAlreadyExists) return; // grup sudah pernah diinjeksi sebelumnya, aman skip semua.
 
-    const item = el('div', {
+    const item = smartPlanningAlreadyExists ? null : el('div', {
       class: 'nav-item nav-item-disabled',
       'data-route': 'smart-planning',
       title: 'Smart Planning — Coming Soon (belum dapat digunakan)',
@@ -2069,7 +2141,7 @@
       ]),
       el('span', { class: 'badge badge-warning', style: 'font-size:9px;padding:2px 6px;' }, ['Soon']),
     ]);
-    item.addEventListener('click', (e) => {
+    if (item) item.addEventListener('click', (e) => {
       e.preventDefault();
       if (App.toast) App.toast('Smart Planning masih Coming Soon — belum dapat digunakan.', 'info');
     });
@@ -2115,7 +2187,7 @@
     const group = el('div', { class: 'nav-group' }, [
       el('div', { class: 'nav-group-title' }, ['Smart FTTH']),
     ]);
-    group.appendChild(item);
+    if (item) group.appendChild(item);
     if (!nav.querySelector('[data-route="detected-buildings"]')) group.appendChild(detectedItem);
     if (!nav.querySelector('[data-route="planning-wizard"]')) group.appendChild(wizardItem);
     if (!nav.querySelector('[data-route="planning-summary"]')) group.appendChild(summaryItem);
@@ -3840,9 +3912,28 @@
   }, function destroyDetected() { if (App.detectedMap) { try { App.detectedMap.remove(); } catch (e) {} App.detectedMap = null; } });
 
   // Kategori bangunan yang dapat diklik di Dashboard (Revision 01, Perubahan 9).
+  // Kartu "Bangunan Terdeteksi" di Dashboard — HANYA menghitung analisa TERBARU
+  // per project (bukan akumulasi seluruh riwayat setiap kali "Analisa Area"
+  // dijalankan ulang), supaya angkanya mencerminkan kondisi project saat ini.
   async function injectBuildingCategories(container) {
+    let analyses = [];
+    try {
+      const { data, error } = await App.supabase.from('planning_analysis').select('id, project_id, analyzed_at').order('analyzed_at', { ascending: false });
+      if (error) throw error;
+      analyses = data || [];
+    } catch (e) { return; }
+    if (!analyses.length) return;
+    // Ambil 1 analisa terbaru saja per project (project_id null dianggap 1 grup tersendiri).
+    const latestPerProject = {};
+    analyses.forEach((a) => { const key = a.project_id || '__tanpa_project__'; if (!(key in latestPerProject)) latestPerProject[key] = a.id; });
+    const analysisIds = Object.values(latestPerProject);
+
     let rows = [];
-    try { const { data } = await App.supabase.from('detected_buildings').select('category'); rows = data || []; } catch (e) { return; }
+    try {
+      const { data, error } = await App.supabase.from('detected_buildings').select('category').in('analysis_id', analysisIds).neq('status', 'removed');
+      if (error) throw error;
+      rows = data || [];
+    } catch (e) { return; }
     if (!rows.length) return;
     const counts = { Rumah: 0, Ruko: 0, Gedung: 0, Apartemen: 0, Lainnya: 0 };
     rows.forEach((r) => { counts[r.category] = (counts[r.category] || 0) + 1; });
@@ -3852,7 +3943,11 @@
       card.addEventListener('click', () => { location.hash = '#/detected-buildings?category=' + encodeURIComponent(c); });
       return card;
     }));
-    container.appendChild(el('div', { class: 'card', style: 'margin-top:16px;' }, [el('div', { class: 'card-header' }, [el('h3', {}, ['Bangunan Terdeteksi (klik untuk daftar)'])]), grid]));
+    container.appendChild(el('div', { class: 'card', style: 'margin-top:16px;' }, [
+      el('div', { class: 'card-header' }, [el('h3', {}, ['Bangunan Terdeteksi (klik untuk daftar)'])]),
+      el('p', { class: 'text-muted', style: 'margin:-6px 0 10px;' }, ['Dihitung dari analisa TERBARU tiap project — bukan akumulasi semua riwayat Analisa Area.']),
+      grid,
+    ]));
   }
   App.injectBuildingCategories = injectBuildingCategories;
 

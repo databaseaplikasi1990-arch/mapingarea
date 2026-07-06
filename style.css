@@ -136,7 +136,11 @@ h1, h2, h3, h4 { margin: 0; font-weight: 600; color: var(--color-text); }
 .sidebar {
   width: var(--sidebar-width); flex-shrink: 0; background: var(--color-sidebar-bg);
   color: var(--color-sidebar-text); display: flex; flex-direction: column;
-  transition: width 0.2s ease; overflow: hidden; z-index: 200;
+  transition: width 0.2s ease; overflow: hidden;
+  /* FIX: harus tetap di atas Leaflet (panes internalnya pakai z-index sampai 700,
+     controls sampai 1000), supaya peta tidak pernah menutup/menangkap klik sidebar,
+     terutama saat sidebar jadi position:fixed di breakpoint mobile (lihat §12). */
+  z-index: 1100;
 }
 .app-shell.sidebar-collapsed .sidebar { width: var(--sidebar-width-collapsed); }
 .sidebar-brand {

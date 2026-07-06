@@ -2258,6 +2258,46 @@
   }
   App.saveDetectedBuildings = saveDetectedBuildings;
 
+  // Konversi detected_buildings -> homes (Rumah). ADDITIF: tidak menghapus/mengubah
+  // form CRUD Rumah biasa — hasil konversi cuma jadi baris `homes` normal yang tetap
+  // bisa diedit manual (nama pemilik, alamat, status, lat/lng) lewat menu Rumah.
+  // Mencegah duplikasi lewat kolom homes.source_building_id (migration 012).
+  async function convertBuildingsToHomes(buildings) {
+    if (!buildings || !buildings.length) return { created: 0, skipped: 0, error: null };
+    const ids = buildings.map((b) => b.id);
+    let already = {};
+    try {
+      const { data, error } = await App.supabase.from('homes').select('source_building_id').in('source_building_id', ids);
+      if (error) throw error;
+      (data || []).forEach((h) => { if (h.source_building_id) already[h.source_building_id] = true; });
+    } catch (e) {
+      // Kolom source_building_id belum ada (migration 012 belum jalan) — beri tahu, jangan lanjut insert
+      // supaya tidak dobel tiap kali tombol dipencet.
+      return { created: 0, skipped: buildings.length, error: 'Jalankan migration_012_homes_from_detected.sql dulu di Supabase.' };
+    }
+    const toCreate = buildings.filter((b) => !already[b.id] && b.lat != null && b.lng != null);
+    if (!toCreate.length) return { created: 0, skipped: buildings.length, error: null };
+    const rows = toCreate.map((b) => ({
+      owner_name: '(Belum diisi — ' + (b.building_id || ('Bangunan ' + String(b.id).slice(0, 8))) + ')',
+      address: null,
+      status: 'Prospek',
+      lat: Number(b.lat), lng: Number(b.lng),
+      source_building_id: b.id, source_kind: 'detected_buildings',
+    }));
+    let created = 0;
+    try {
+      for (let i = 0; i < rows.length; i += 500) {
+        const { error } = await App.supabase.from('homes').insert(rows.slice(i, i + 500));
+        if (error) throw error;
+        created += Math.min(500, rows.length - i);
+      }
+    } catch (err) {
+      return { created, skipped: buildings.length - created, error: err.message };
+    }
+    return { created, skipped: buildings.length - created, error: null };
+  }
+  App.convertBuildingsToHomes = convertBuildingsToHomes;
+
   // Entry point tombol "Analisa Area". projectId opsional.
   async function runAreaAnalysis(projectId) {
     const out = await performBoundaryAnalysis(projectId);
@@ -2375,6 +2415,37 @@
       el('div', { class: 'card-header' }, [el('h3', {}, ['Detail Analisa'])]),
       el('div', { class: 'table-wrap' }, [infoTable]),
     ]));
+
+    // ---- Buat Data Rumah otomatis dari hasil deteksi (additif, tidak menghapus form manual) ----
+    if (analysis.id) {
+      const homesCard = el('div', { class: 'card', style: 'margin-top:16px;' }, [
+        el('div', { class: 'card-header' }, [el('h3', {}, ['Data Rumah dari Hasil Deteksi'])]),
+        el('p', { class: 'text-muted', style: 'margin:0 0 10px;' }, [
+          'Buat baris Rumah otomatis (lat/lng terisi) dari bangunan kategori "Rumah" hasil Analisa Area ini. ' +
+          'Nama pemilik & alamat akan kosong/placeholder — tetap bisa diisi/diedit manual lewat menu Rumah seperti biasa. ' +
+          'Aman dijalankan berkali-kali, bangunan yang sudah pernah dikonversi tidak akan dobel.',
+        ]),
+        el('button', {
+          class: 'btn btn-primary btn-sm', onclick: async (e) => {
+            const btn = e.currentTarget; btn.disabled = true;
+            toast('Membuat data Rumah dari hasil deteksi...', 'info');
+            let bld = [];
+            try {
+              const { data, error } = await App.supabase.from('detected_buildings').select('id,building_id,lat,lng,category').eq('analysis_id', analysis.id).eq('category', 'Rumah').neq('status', 'removed');
+              if (error) throw error;
+              bld = data || [];
+            } catch (err) { toast('Detected Buildings belum tersedia (jalankan migration 008 & analisa ulang).', 'warning', 5000); btn.disabled = false; return; }
+            if (!bld.length) { toast('Tidak ada bangunan kategori Rumah untuk analisa ini.', 'warning', 4000); btn.disabled = false; return; }
+            const res = await App.convertBuildingsToHomes(bld);
+            if (res.error) { toast(res.error, 'error', 6000); }
+            else { toast(res.created + ' Rumah baru dibuat' + (res.skipped ? ', ' + res.skipped + ' sudah ada sebelumnya' : '') + '. Buka menu Rumah untuk lihat/edit manual.', 'success', 6000); }
+            btn.disabled = false;
+          },
+        }, [el('i', { class: 'fa-solid fa-house-circle-check' }), ' Buat Data Rumah dari Deteksi']),
+        el('button', { class: 'btn btn-secondary btn-sm', style: 'margin-left:8px;', onclick: () => { location.hash = '#/homes'; } }, [el('i', { class: 'fa-solid fa-house' }), ' Buka Menu Rumah']),
+      ]);
+      container.appendChild(homesCard);
+    }
 
     // ---- Peta hasil dengan layer yang dapat diaktif/nonaktifkan ----
     const mapCard = el('div', { class: 'card', style: 'margin-top:16px;' }, [
@@ -3544,6 +3615,11 @@
     const rows = await loadDetectedBuildings({ analysisId });
     if (rows === null) { container.appendChild(el('div', { class: 'card empty-state' }, [el('i', { class: 'fa-solid fa-triangle-exclamation' }), el('h3', {}, ['Tabel belum tersedia']), el('p', { class: 'text-muted' }, ['Jalankan migration 008_detected_buildings.sql lalu analisa ulang.'])])); return; }
     st.rows = rows;
+    st.homeMap = {}; // building_id -> true kalau sudah pernah dikonversi jadi Rumah
+    try {
+      const { data } = await App.supabase.from('homes').select('source_building_id').in('source_building_id', rows.map((r) => r.id));
+      (data || []).forEach((h) => { if (h.source_building_id) st.homeMap[h.source_building_id] = true; });
+    } catch (e) { /* migration 012 belum jalan — badge "Jadikan Rumah" tetap tampil, tombol akan kasih pesan */ }
 
     // Toolbar.
     const searchIn = el('input', { class: 'text-input', placeholder: 'Cari Building ID / kategori...', style: 'max-width:220px;', oninput: (e) => { st.search = e.target.value.trim().toLowerCase(); st.page = 1; paint(); } });
@@ -3565,6 +3641,7 @@
       el('button', { class: 'btn btn-primary btn-sm', onclick: addBuilding }, [el('i', { class: 'fa-solid fa-plus' }), ' Tambah']),
       el('button', { class: 'btn btn-secondary btn-sm', onclick: mergeSelected }, [el('i', { class: 'fa-solid fa-object-group' }), ' Merge terpilih']),
       el('button', { class: 'btn btn-secondary btn-sm', onclick: splitSelected }, [el('i', { class: 'fa-solid fa-object-ungroup' }), ' Split terpilih']),
+      el('button', { class: 'btn btn-secondary btn-sm', onclick: convertSelectedToHomes }, [el('i', { class: 'fa-solid fa-house-circle-check' }), ' Jadikan Rumah (terpilih)']),
       el('button', { class: 'btn btn-danger btn-sm', onclick: deleteSelected }, [el('i', { class: 'fa-solid fa-trash' }), ' Hapus terpilih']),
     ]);
 
@@ -3634,7 +3711,7 @@
 
       tableWrap.innerHTML = '';
       const table = el('table', { class: 'data-table' }, [
-        el('thead', {}, [el('tr', {}, ['', 'No', 'Building ID', 'Lat', 'Lng', 'Area', 'Perimeter', 'Kategori', 'Confidence', 'Status', 'Planner', 'Tanggal'].map((h) => el('th', {}, [h])))]),
+        el('thead', {}, [el('tr', {}, ['', 'No', 'Building ID', 'Lat', 'Lng', 'Area', 'Perimeter', 'Kategori', 'Confidence', 'Status', 'Rumah', 'Planner', 'Tanggal'].map((h) => el('th', {}, [h])))]),
         el('tbody', {}, pageRows.map((r, i) => {
           const cb = el('input', { type: 'checkbox', onclick: (e) => { e.stopPropagation(); if (e.target.checked) st.selected[r.id] = true; else delete st.selected[r.id]; } });
           if (st.selected[r.id]) cb.setAttribute('checked', 'checked');
@@ -3649,6 +3726,7 @@
             el('td', {}, [el('span', { class: 'badge badge-neutral' }, [r.category || '-'])]),
             el('td', {}, [String(r.confidence != null ? r.confidence : '-')]),
             el('td', {}, [el('span', { class: 'badge badge-' + (r.status === 'detected' ? 'info' : (r.status === 'removed' ? 'danger' : 'success')) }, [r.status || '-'])]),
+            el('td', {}, [st.homeMap[r.id] ? el('span', { class: 'badge badge-success', title: 'Sudah ada baris Rumah dari bangunan ini' }, ['✓ Rumah']) : el('span', { class: 'text-xs text-muted' }, ['-'])]),
             el('td', { class: 'text-xs' }, [r.planner || '-']),
             el('td', { class: 'text-xs text-muted' }, [String(r.created_at || '').slice(0, 10)]),
           ]);
@@ -3686,6 +3764,9 @@
           el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { zoomTo(r); } }, [el('i', { class: 'fa-solid fa-magnifying-glass-plus' }), ' Zoom']),
           el('button', { class: 'btn btn-secondary btn-sm', onclick: () => duplicateBuilding(r) }, [el('i', { class: 'fa-solid fa-clone' }), ' Duplicate']),
           el('button', { class: 'btn btn-secondary btn-sm', onclick: () => splitBuilding(r) }, [el('i', { class: 'fa-solid fa-object-ungroup' }), ' Split']),
+          st.homeMap[r.id]
+            ? el('button', { class: 'btn btn-secondary btn-sm', disabled: 'disabled', title: 'Sudah ada baris Rumah dari bangunan ini' }, [el('i', { class: 'fa-solid fa-house-circle-check' }), ' Sudah jadi Rumah'])
+            : el('button', { class: 'btn btn-secondary btn-sm', onclick: () => convertSelectedToHomes([r]) }, [el('i', { class: 'fa-solid fa-house-circle-check' }), ' Jadikan Rumah']),
           el('button', { class: 'btn btn-danger btn-sm', onclick: () => deleteBuilding(r) }, [el('i', { class: 'fa-solid fa-trash' }), ' Hapus']),
         ]),
       ]));
@@ -3742,6 +3823,18 @@
       if (d) { try { await App.supabase.from('detected_buildings').delete().in('id', ids); } catch (e) {} afterChange(ids.length + ' bangunan digabung'); }
     }
     async function splitSelected() { const ids = Object.keys(st.selected); if (ids.length !== 1) { toast('Pilih tepat 1 bangunan untuk split.', 'info'); return; } const r = st.rows.find((x) => x.id === ids[0]); if (r) splitBuilding(r); }
+    // Jadikan Rumah — additif, tidak menghapus kemampuan isi/edit manual di menu Rumah.
+    async function convertSelectedToHomes(explicitRows) {
+      const list = explicitRows || Object.keys(st.selected).map((id) => st.rows.find((x) => x.id === id)).filter(Boolean);
+      if (!list.length) { toast('Pilih baris dulu (checkbox), atau klik "Jadikan Rumah" di detail bangunan.', 'info'); return; }
+      toast('Membuat data Rumah...', 'info');
+      const res = await App.convertBuildingsToHomes(list);
+      if (res.error) { toast(res.error, 'error', 6000); return; }
+      toast(res.created + ' Rumah baru dibuat' + (res.skipped ? ', ' + res.skipped + ' sudah ada sebelumnya' : '') + '. Bisa diedit manual di menu Rumah.', 'success', 5000);
+      const fresh = { ...st.homeMap };
+      list.forEach((r) => { fresh[r.id] = true; });
+      st.homeMap = fresh; st.selected = {}; paint(); if (st.detail) renderDetail();
+    }
 
     paint();
   }, function destroyDetected() { if (App.detectedMap) { try { App.detectedMap.remove(); } catch (e) {} App.detectedMap = null; } });

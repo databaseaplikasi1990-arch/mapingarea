@@ -17,7 +17,7 @@
   'use strict';
 
   /* ================= [CORE] STATE GLOBAL ================= */
-  const CFG = window.APP_CONFIG;
+  const CFG = window.CFG;
 
   const App = {
     supabase: null,

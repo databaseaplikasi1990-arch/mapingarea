@@ -243,4 +243,10 @@
       },
     },
   };
+  // FIX #E11 (kritis): app.js membaca `window.APP_CONFIG` (const CFG = window.APP_CONFIG;),
+  // sedangkan file ini sebelumnya HANYA mengisi `window.CFG` — beda nama, jadi CFG di app.js
+  // selalu undefined dan aplikasi gagal total sejak baris pertama ("Cannot read properties of
+  // undefined (reading 'THEME')"). Alias di bawah ini membuat KEDUA nama tersedia, supaya
+  // aplikasi tetap jalan apa pun nama yang dipakai skrip lain yang mereferensikan config ini.
+  window.APP_CONFIG = window.CFG;
 })();

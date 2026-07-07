@@ -17,7 +17,7 @@
   'use strict';
 
   /* ================= [CORE] STATE GLOBAL ================= */
-  const CFG = window.CFG;
+  const CFG = window.APP_CONFIG;
 
   const App = {
     supabase: null,
@@ -28,10 +28,14 @@
     currentRoute: 'dashboard',
     map: null,
     heatMap: null,
-    mapLayers: {},           // key -> L.LayerGroup
-    currentMapProjectId: null, // project aktif di halaman Mapping — bertahan selama sesi (pindah menu tidak reset).
+    mapLayers: {},           // key -> L.LayerGroup (layer HASIL IMPORT, folder "Data Import")
+    assetLayerGroups: {},    // assetKey -> L.LayerGroup (folder "Aset FTTH", lazy-loaded per tipe aset)
     autosaveTimer: null,
     realtimeChannels: [],
+    // FIX #E5 (per-project scoping): project yang sedang aktif dipilih user.
+    // null = belum ada project dipilih (tampilan lama/lintas-project).
+    currentProjectId: localStorage.getItem('ma_active_project') || null,
+    currentProjectName: localStorage.getItem('ma_active_project_name') || null,
   };
   window.App = App; // ekspos untuk debugging di console
 
@@ -48,7 +52,10 @@
         else node.setAttribute(k, v);
       });
     }
-    (children || []).forEach((c) => node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c));
+    (children || []).forEach((c) => {
+      if (c === null || c === undefined || c === false) return; // FIX #E1: cegah crash appendChild(null) dari children kondisional (mis. `cond ? el(...) : null`)
+      node.appendChild(typeof c === 'string' || typeof c === 'number' ? document.createTextNode(String(c)) : c);
+    });
     return node;
   }
   function fmtNumber(n) {
@@ -64,6 +71,36 @@
     let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), wait); };
   }
   // Jarak antar 2 titik lat/lng dalam meter (formula Haversine).
+  // FIX #E5 (per-project scoping): daftar tabel aset yang punya kolom project_id
+  // (lihat supabase/schema_full.sql migration 003). Dipakai untuk otomatis
+  // menyaring query List & mengisi project_id saat Tambah data baru, supaya
+  // "ganti project aktif -> semua angka balik ke 0 untuk project itu" beneran jalan.
+  const PROJECT_SCOPED_TABLES = [
+    'areas', 'pops', 'odc', 'odp', 'homes', 'poles', 'backbones',
+    'distributions', 'kabels', 'closures', 'handholes', 'jointboxes',
+    'planning_analysis', 'detected_buildings',
+  ];
+  // Tambahkan .eq('project_id', ...) HANYA bila ada project aktif dan tabelnya memang berelasi ke project.
+  function scopeToProject(query, table) {
+    if (App.currentProjectId && PROJECT_SCOPED_TABLES.includes(table)) {
+      return query.eq('project_id', App.currentProjectId);
+    }
+    return query;
+  }
+  App.scopeToProject = scopeToProject;
+
+  // Ganti project aktif: simpan ke localStorage + App, lalu render ulang switcher
+  // dan halaman yang sedang dibuka supaya datanya ikut ter-filter ulang.
+  function setActiveProject(id, name) {
+    App.currentProjectId = id || null;
+    App.currentProjectName = name || null;
+    if (id) { localStorage.setItem('ma_active_project', id); localStorage.setItem('ma_active_project_name', name || ''); }
+    else { localStorage.removeItem('ma_active_project'); localStorage.removeItem('ma_active_project_name'); }
+    if (typeof renderProjectSwitcher === 'function') renderProjectSwitcher();
+    if (App.currentRoute) navigateTo(App.currentRoute);
+  }
+  App.setActiveProject = setActiveProject;
+
   function haversineMeters(lat1, lng1, lat2, lng2) {
     const R = 6371000;
     const toRad = (d) => (d * Math.PI) / 180;
@@ -291,14 +328,14 @@
     container.innerHTML = '';
     const grid = el('div', { class: 'stat-grid' });
     const statDefs = [
-      { key: 'totalProject', label: 'Total Project', icon: 'fa-folder', route: 'project' },
-      { key: 'totalArea', label: 'Total Area', icon: 'fa-draw-polygon', route: 'areas' },
-      { key: 'totalRumah', label: 'Total Rumah', icon: 'fa-house', route: 'homes' },
-      { key: 'totalTiang', label: 'Total Tiang', icon: 'fa-tower-cell', route: 'poles' },
-      { key: 'totalOdc', label: 'Total ODC', icon: 'fa-server', route: 'odc' },
-      { key: 'totalOdp', label: 'Total ODP', icon: 'fa-diagram-project', route: 'odp' },
-      { key: 'coveragePercent', label: 'Coverage', icon: 'fa-wifi', suffix: '%', route: 'coverage' },
-      { key: 'surveyProgressPercent', label: 'Progress Survey', icon: 'fa-clipboard-check', suffix: '%', route: 'validation' },
+      { key: 'totalProject', label: 'Total Project', icon: 'fa-folder' },
+      { key: 'totalArea', label: 'Total Area', icon: 'fa-draw-polygon' },
+      { key: 'totalRumah', label: 'Total Rumah', icon: 'fa-house' },
+      { key: 'totalTiang', label: 'Total Tiang', icon: 'fa-tower-cell' },
+      { key: 'totalOdc', label: 'Total ODC', icon: 'fa-server' },
+      { key: 'totalOdp', label: 'Total ODP', icon: 'fa-diagram-project' },
+      { key: 'coveragePercent', label: 'Coverage', icon: 'fa-wifi', suffix: '%' },
+      { key: 'surveyProgressPercent', label: 'Progress Survey', icon: 'fa-clipboard-check', suffix: '%' },
     ];
     const cardsByKey = {};
     statDefs.forEach((s) => {
@@ -307,10 +344,10 @@
         el('div', { class: 'stat-icon' }, [el('i', { class: `fa-solid ${s.icon}` })]),
         el('div', {}, [valueEl, el('div', { class: 'stat-label' }, [s.label])]),
       ]);
-      if (s.route) {
+      if (s.key === 'totalProject') {
         card.style.cursor = 'pointer';
-        card.title = 'Buka menu ' + s.label;
-        card.addEventListener('click', () => { location.hash = '#/' + s.route; });
+        card.title = 'Buka daftar project';
+        card.addEventListener('click', () => { location.hash = '#/project'; });
       }
       cardsByKey[s.key] = { valueEl, suffix: s.suffix || '' };
       grid.appendChild(card);
@@ -347,13 +384,22 @@
 
   async function loadDashboardStats() {
     const tables = {
-      totalProject: 'projects', totalArea: 'areas', totalRumah: 'homes',
+      totalArea: 'areas', totalRumah: 'homes',
       totalTiang: 'poles', totalOdc: 'odc', totalOdp: 'odp',
     };
     const result = { coveragePercent: 0, surveyProgressPercent: 0 };
+    // "Total Project" selalu lintas-project (menghitung semua project yang ada).
+    try {
+      const { count } = await App.supabase.from('projects').select('*', { count: 'exact', head: true });
+      result.totalProject = count || 0;
+    } catch (e) { result.totalProject = 0; }
+    // FIX #E5: sisanya di-scope ke Project Aktif (kalau ada yang dipilih) supaya
+    // ganti project baru -> semua angka balik ke 0 untuk project itu.
     await Promise.all(Object.entries(tables).map(async ([statKey, table]) => {
       try {
-        const { count, error } = await App.supabase.from(table).select('*', { count: 'exact', head: true });
+        let q = App.supabase.from(table).select('*', { count: 'exact', head: true });
+        q = scopeToProject(q, table);
+        const { count, error } = await q;
         result[statKey] = error ? 0 : (count || 0);
       } catch (e) { result[statKey] = 0; }
     }));
@@ -394,25 +440,8 @@
   /* ================= [MAPPING] PETA + IMPORT ================= */
   registerModule('mapping', async function renderMapping(container) {
     container.innerHTML = '';
-    // Dropdown pilih Project — layer import akan tersimpan permanen & terikat ke project ini,
-    // sehingga tidak hilang lagi saat pindah menu (Migration 013: map_import_layers).
-    const projectSelect = el('select', { class: 'text-input', style: 'max-width:220px;' }, [
-      el('option', { value: '' }, ['— Pilih Project (agar import tersimpan) —']),
-    ]);
-    try {
-      const { data } = await App.supabase.from('projects').select('id,name').order('created_at', { ascending: false }).limit(500);
-      (data || []).forEach((p) => projectSelect.appendChild(el('option', { value: p.id, selected: App.currentMapProjectId === p.id ? 'selected' : null }, [p.name])));
-    } catch (e) { /* projects belum ada */ }
-    projectSelect.addEventListener('change', async (e) => {
-      App.currentMapProjectId = e.target.value || null;
-      clearAllMapLayers();
-      if (App.currentMapProjectId) await loadSavedMapLayers(App.currentMapProjectId);
-      toast(App.currentMapProjectId ? 'Project dipilih — import berikutnya otomatis tersimpan & dimuat ulang di project ini.' : 'Tidak ada project dipilih — import hanya sementara (hilang saat pindah menu).', 'info', 5000);
-    });
-
     // Toolbar halaman
     $('#page-toolbar').appendChild(el('div', { class: 'table-toolbar' }, [
-      projectSelect,
       el('button', { class: 'btn btn-secondary btn-sm', onclick: () => openImportDialog() }, [
         el('i', { class: 'fa-solid fa-file-import' }), ' Import Data',
       ]),
@@ -445,29 +474,12 @@
     container.appendChild(layout);
 
     initMap(mapWrap);
-    if (App.currentMapProjectId) await loadSavedMapLayers(App.currentMapProjectId);
+    refreshLayerList(); // FIX #E6: tampilkan folder Aset FTTH begitu halaman Mapping dibuka (bukan cuma setelah import)
   }, function destroyMapping() {
     if (App.map) { App.map.remove(); App.map = null; }
     App.mapLayers = {};
+    App.assetLayerGroups = {}; // FIX #E6: layer aset terikat ke instance peta lama, harus dibuat ulang saat halaman Mapping dibuka lagi
   });
-
-  // Hapus semua layer dari peta (tanpa hapus dari DB) — dipakai saat ganti project.
-  function clearAllMapLayers() {
-    Object.keys(App.mapLayers).forEach((key) => { try { App.map.removeLayer(App.mapLayers[key]); } catch (e) {} delete App.mapLayers[key]; });
-    refreshLayerList();
-  }
-
-  // Muat ulang layer yang pernah diimpor & tersimpan untuk project ini (Migration 013).
-  async function loadSavedMapLayers(projectId) {
-    try {
-      const { data, error } = await App.supabase.from('map_import_layers').select('*').eq('project_id', projectId).order('created_at', { ascending: true });
-      if (error) throw error;
-      (data || []).forEach((row) => addGeoJsonLayer(row.name, row.geojson, { dbId: row.id, color: row.color, skipSave: true }));
-      if (data && data.length) toast(data.length + ' layer tersimpan dimuat ulang untuk project ini.', 'success', 3500);
-    } catch (e) {
-      // migration_013_map_import_layers.sql belum dijalankan — diamkan, fallback ke perilaku lama (memori saja).
-    }
-  }
 
   function initMap(mapWrap) {
     App.map = L.map(mapWrap, { zoomControl: false }).setView(CFG.DEFAULT_CENTER, CFG.DEFAULT_ZOOM);
@@ -575,8 +587,27 @@
   // shapeType: 'polygon' | 'polyline'
   // onComplete(geojsonGeometry, layer) dipanggil sekali setelah user selesai
   // menggambar (double-click / klik titik awal lagi, sesuai leaflet.draw).
+  // FIX #E4: sebelumnya, saat form CRUD (mis. "Tambah Rumah") memanggil
+  // pickLocationOnMap/drawGeometryOnMap, modal TIDAK ditutup — overlay modal
+  // (fixed, full-screen) tetap menutupi peta sehingga user tidak bisa klik
+  // peta sama sekali (atau klik area gelap malah menutup form tanpa memilih
+  // lokasi). Helper ini menyembunyikan sementara overlay yang sedang terbuka
+  // (tanpa menghapus DOM-nya — semua isian form tetap tersimpan), lalu
+  // menampilkannya kembali begitu user selesai memilih lokasi/menggambar.
+  function hideOpenModalsForMapPick() {
+    const modalRoot = $('#modal-root');
+    const overlays = $all('.modal-overlay', modalRoot);
+    overlays.forEach((o) => { o.dataset.prevDisplay = o.style.display || ''; o.style.display = 'none'; });
+    if (overlays.length) modalRoot.style.pointerEvents = 'none';
+    return function restoreModals() {
+      overlays.forEach((o) => { o.style.display = o.dataset.prevDisplay || ''; });
+      if (overlays.length) modalRoot.style.pointerEvents = 'auto';
+    };
+  }
+
   function drawGeometryOnMap(shapeType, onComplete) {
-    toast('Gambar di peta, lalu klik titik awal lagi (atau double-click) untuk menyelesaikan.', 'info', 4500);
+    const restoreModals = hideOpenModalsForMapPick();
+    toast('Gambar di peta, lalu klik titik awal lagi (atau double-click) untuk menyelesaikan. Form akan muncul kembali otomatis.', 'info', 4500);
     location.hash = '#/mapping';
     const tryStart = () => {
       if (!App.map) { setTimeout(tryStart, 200); return; }
@@ -590,6 +621,7 @@
         const layer = e.layer;
         layer.addTo(App.map);
         const geojson = layer.toGeoJSON();
+        restoreModals();
         onComplete(geojson.geometry, layer);
       };
       App.map.on(L.Draw.Event.CREATED, onCreated);
@@ -688,10 +720,9 @@
     }
   }
 
-  function addGeoJsonLayer(name, geojson, opts) {
-    opts = opts || {};
+  function addGeoJsonLayer(name, geojson) {
     if (!App.map) return;
-    const color = opts.color || randomLayerColor();
+    const color = randomLayerColor();
     const layer = L.geoJSON(geojson, {
       style: { color, weight: 2, fillOpacity: 0.15 },
       pointToLayer: (feature, latlng) => L.circleMarker(latlng, { radius: 6, color, fillColor: color, fillOpacity: 0.8 }),
@@ -706,34 +737,9 @@
     const clusterGroup = L.markerClusterGroup ? L.markerClusterGroup() : L.layerGroup();
     layer.eachLayer((l) => { if (l instanceof L.CircleMarker || l instanceof L.Marker) clusterGroup.addLayer(l); });
     layer.addTo(App.map);
-    layer._dbId = opts.dbId || null;
     App.mapLayers[name + '_' + Date.now()] = layer;
     try { App.map.fitBounds(layer.getBounds(), { maxZoom: 17 }); } catch (e) {}
     refreshLayerList();
-
-    // Simpan permanen ke project aktif (Migration 013) supaya tidak hilang saat
-    // pindah menu. Kalau belum pilih project / migration belum jalan, layer
-    // tetap tampil (perilaku lama) tapi cuma sementara di memori browser.
-    if (!opts.skipSave) {
-      if (!App.currentMapProjectId) {
-        toast('Layer "' + name + '" belum tersimpan permanen — pilih Project dulu di toolbar Mapping.', 'warning', 6000);
-      } else {
-        (async () => {
-          try {
-            const featureCount = (geojson && geojson.features) ? geojson.features.length : 1;
-            const { data, error } = await App.supabase.from('map_import_layers').insert({
-              project_id: App.currentMapProjectId, name, color, geojson, feature_count: featureCount,
-              planner: (App.profile && App.profile.full_name) || 'Pengguna',
-              created_by: (App.session && App.session.user && App.session.user.id) || null,
-            }).select('id').single();
-            if (error) throw error;
-            layer._dbId = data.id;
-          } catch (e) {
-            toast('Layer tampil tapi GAGAL tersimpan permanen (jalankan migration_013_map_import_layers.sql).', 'warning', 6000);
-          }
-        })();
-      }
-    }
   }
 
   function randomLayerColor() {
@@ -741,35 +747,222 @@
     return palette[Math.floor(Math.random() * palette.length)];
   }
 
-  function refreshLayerList() {
+  // FIX #E6 (Layer ala Google Earth): metadata folder per tipe aset — icon +
+  // "keterangan" singkat yang tampil di bawah nama folder, seperti deskripsi
+  // folder di Google Earth ("My Places"). Sumbernya sama dengan CFG.ASSET_DEFS.
+  const ASSET_FOLDER_META = {
+    areas: { icon: 'fa-draw-polygon', unit: 'polygon', desc: 'Batas area kerja/coverage.' },
+    pops: { icon: 'fa-satellite-dish', unit: 'titik', desc: 'Point of Presence — sumber utama jaringan.' },
+    odc: { icon: 'fa-server', unit: 'titik', desc: 'Optical Distribution Cabinet — splitter 1:4 dari POP.' },
+    odp: { icon: 'fa-diagram-project', unit: 'titik', desc: 'Optical Distribution Point — splitter 1:8 ke rumah.' },
+    homes: { icon: 'fa-house', unit: 'titik', desc: 'Rumah pelanggan/prospek homepass.' },
+    poles: { icon: 'fa-tower-cell', unit: 'titik', desc: 'Tiang penopang jalur kabel.' },
+    backbones: { icon: 'fa-route', unit: 'jalur', desc: 'Jalur backbone (POP ⟷ ODC).' },
+    distributions: { icon: 'fa-share-nodes', unit: 'jalur', desc: 'Jalur distribution (ODC ⟷ ODP).' },
+    kabels: { icon: 'fa-ethernet', unit: 'jalur', desc: 'Kabel drop / feeder lainnya.' },
+    closures: { icon: 'fa-box-archive', unit: 'titik', desc: 'Sambungan/closure kabel fiber.' },
+    handholes: { icon: 'fa-vault', unit: 'titik', desc: 'Handhole bawah tanah.' },
+    jointboxes: { icon: 'fa-plug-circle-bolt', unit: 'titik', desc: 'Joint box sambungan kabel.' },
+  };
+  // Status expand/collapse folder (disimpan di memori tab; reset tiap reload — cukup untuk UX, tidak perlu tabel DB baru).
+  const layerTreeState = { import: true, ftth: true, sub: {} };
+
+  function toggleFolder(key) {
+    if (key === 'import') layerTreeState.import = !layerTreeState.import;
+    else if (key === 'ftth') layerTreeState.ftth = !layerTreeState.ftth;
+    else layerTreeState.sub[key] = !layerTreeState.sub[key];
+    refreshLayerList();
+  }
+
+  // Lazy-load 1 tipe aset (scoped ke Project Aktif) jadi layer group di peta, dipanggil
+  // saat user centang folder-nya untuk pertama kali. Dipisah dari App.mapLayers (folder Import)
+  // supaya "hapus layer import" tidak pernah tidak sengaja menghapus data aset dari DB.
+  async function loadAssetTypeLayer(assetKey, def) {
+    if (App.assetLayerGroups[assetKey]) return App.assetLayerGroups[assetKey];
+    const color = randomLayerColor();
+    const lg = window.L.markerClusterGroup && def.geometryType === 'point' ? L.markerClusterGroup() : L.layerGroup();
+    try {
+      let q = App.supabase.from(def.table).select('*').limit(2000);
+      q = scopeToProject(q, def.table);
+      const { data, error } = await q;
+      if (error) throw error;
+      (data || []).forEach((row) => {
+        if (def.geometryType === 'point') {
+          if (row.lat == null || row.lng == null) return;
+          L.circleMarker([row.lat, row.lng], { radius: 6, color, fillColor: color, fillOpacity: 0.8 })
+            .bindPopup('<b>' + def.title + '</b><br>' + (row.name || row.owner_name || row.code || row.id))
+            .addTo(lg);
+        } else {
+          const raw = row[def.geometryColumn];
+          if (!raw) return;
+          try { L.geoJSON(raw, { style: { color, weight: def.geometryType === 'polygon' ? 2 : 3, fillOpacity: 0.12 } }).addTo(lg); } catch (e) {}
+        }
+      });
+    } catch (e) { /* tabel belum ada / belum migrasi — folder tetap tampil tapi kosong */ }
+    App.assetLayerGroups[assetKey] = lg;
+    return lg;
+  }
+
+  // FIX #E8 (rename & custom folder, lanjutan "Layer ala Google Earth"):
+  // - importFolders: folder BEBAS buatan user untuk mengelompokkan hasil import
+  //   (mis. "Cluster A", "Rumah RW 04"). Hidup selama sesi/tab (hasil import
+  //   sendiri memang tidak tersimpan ke DB, jadi wajar folder ini juga per-sesi).
+  // - layerLabelOverrides: nama tampilan custom (rename) untuk layer import
+  //   MAUPUN folder Aset FTTH — ini DIPERSIST ke localStorage supaya tidak
+  //   hilang tiap reload (mis. rename folder "ODP" jadi "ODP Fiberhome").
+  const importFolders = [];               // [{ id, name }]
+  const importFolderAssign = {};          // layerKey -> folderId
+  let layerLabelOverrides = {};
+  try { layerLabelOverrides = JSON.parse(localStorage.getItem('ma_layer_label_overrides') || '{}'); } catch (e) { layerLabelOverrides = {}; }
+  function saveLabelOverrides() { try { localStorage.setItem('ma_layer_label_overrides', JSON.stringify(layerLabelOverrides)); } catch (e) {} }
+  function labelFor(key, fallback) { return layerLabelOverrides[key] || fallback; }
+  function renameLabel(key, fallback) {
+    const current = labelFor(key, fallback);
+    const next = window.prompt('Ganti nama menjadi:', current);
+    if (next === null) return; // dibatalkan
+    const trimmed = next.trim();
+    if (!trimmed) { toast('Nama tidak boleh kosong.', 'warning'); return; }
+    layerLabelOverrides[key] = trimmed;
+    saveLabelOverrides();
+    refreshLayerList();
+  }
+  function createImportFolder() {
+    const name = window.prompt('Nama folder baru (mis. "Cluster A", "Rumah RW 04"):', '');
+    if (!name || !name.trim()) return;
+    importFolders.push({ id: 'f' + Date.now(), name: name.trim() });
+    refreshLayerList();
+  }
+  function renameImportFolder(folder) {
+    const next = window.prompt('Ganti nama folder menjadi:', folder.name);
+    if (next === null) return;
+    if (!next.trim()) { toast('Nama folder tidak boleh kosong.', 'warning'); return; }
+    folder.name = next.trim();
+    refreshLayerList();
+  }
+  function deleteImportFolder(folder) {
+    Object.keys(importFolderAssign).forEach((k) => { if (importFolderAssign[k] === folder.id) delete importFolderAssign[k]; });
+    const idx = importFolders.findIndex((f) => f.id === folder.id);
+    if (idx > -1) importFolders.splice(idx, 1);
+    refreshLayerList();
+  }
+
+  async function refreshLayerList() {
     const listEl = $('#layer-list');
     if (!listEl) return;
     listEl.innerHTML = '';
-    const keys = Object.keys(App.mapLayers);
-    if (!keys.length) {
-      listEl.appendChild(el('p', { class: 'text-muted' }, ['Belum ada layer. Import data untuk memulai.']));
-      return;
-    }
-    keys.forEach((key) => {
-      const name = key.split('_')[0];
-      const savedBadge = App.mapLayers[key]._dbId ? el('i', { class: 'fa-solid fa-cloud', style: 'font-size:10px;color:var(--color-success);margin-left:4px;', title: 'Tersimpan permanen' }) : el('i', { class: 'fa-solid fa-triangle-exclamation', style: 'font-size:10px;color:var(--color-warning);margin-left:4px;', title: 'Belum tersimpan — hilang saat pindah menu' });
-      const item = el('div', { class: 'layer-item' }, [
+    const tree = el('div', { class: 'layer-tree' });
+
+    // ---- FOLDER 1: Data Import (KMZ/KML/GeoJSON/SHP) — dengan rename & folder custom ----
+    const importKeys = Object.keys(App.mapLayers);
+    const importBody = el('div', { class: 'layer-folder-body' + (layerTreeState.import ? '' : ' hidden') });
+
+    function renderImportItem(key) {
+      const label = labelFor('import:' + key, key.split('_')[0]);
+      const folderOptions = [el('option', { value: '' }, ['Tanpa Folder']), ...importFolders.map((f) => el('option', { value: f.id }, [f.name]))];
+      const moveSelect = el('select', { class: 'text-input', style: 'font-size:11px;padding:3px 4px;max-width:110px;', title: 'Pindahkan ke folder' }, folderOptions);
+      moveSelect.value = importFolderAssign[key] || '';
+      moveSelect.addEventListener('change', () => {
+        if (moveSelect.value) importFolderAssign[key] = moveSelect.value; else delete importFolderAssign[key];
+        refreshLayerList();
+      });
+      return el('div', { class: 'layer-item' }, [
         el('input', { type: 'checkbox', checked: 'checked', onchange: (e) => {
           const layer = App.mapLayers[key];
           if (e.target.checked) App.map.addLayer(layer); else App.map.removeLayer(layer);
         } }),
-        el('span', {}, [name]),
-        savedBadge,
-        el('button', { class: 'icon-btn btn-icon-only', style: 'margin-left:auto;width:26px;height:26px;', onclick: async () => {
-          const layer = App.mapLayers[key];
-          App.map.removeLayer(layer);
-          delete App.mapLayers[key];
-          if (layer._dbId) { try { await App.supabase.from('map_import_layers').delete().eq('id', layer._dbId); } catch (e) {} }
+        el('span', { style: 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;' }, [label]),
+        moveSelect,
+        el('button', { class: 'icon-btn btn-icon-only', title: 'Rename', style: 'width:24px;height:24px;', onclick: () => renameLabel('import:' + key, key.split('_')[0]) }, [el('i', { class: 'fa-solid fa-pen', style: 'font-size:10px' })]),
+        el('button', { class: 'icon-btn btn-icon-only', title: 'Hapus dari peta', style: 'width:24px;height:24px;', onclick: () => {
+          App.map.removeLayer(App.mapLayers[key]);
+          delete App.mapLayers[key]; delete importFolderAssign[key];
           refreshLayerList();
         } }, [el('i', { class: 'fa-solid fa-trash', style: 'font-size:11px' })]),
       ]);
-      listEl.appendChild(item);
+    }
+
+    if (!importKeys.length) {
+      importBody.appendChild(el('p', { class: 'text-xs text-muted', style: 'padding:4px 8px;' }, ['Belum ada file diimport.']));
+    } else {
+      // Folder custom dulu (kalau ada), baru item yang belum masuk folder mana pun.
+      importFolders.forEach((folder) => {
+        const memberKeys = importKeys.filter((k) => importFolderAssign[k] === folder.id);
+        const expanded = !!layerTreeState.sub['imp:' + folder.id];
+        importBody.appendChild(el('div', { class: 'layer-folder layer-subfolder' }, [
+          el('div', { class: 'layer-folder-header' }, [
+            el('i', { class: 'fa-solid ' + (expanded ? 'fa-chevron-down' : 'fa-chevron-right'), style: 'width:12px;font-size:10px;cursor:pointer;', onclick: () => toggleFolder('imp:' + folder.id) }),
+            el('i', { class: 'fa-solid fa-folder', style: 'color:#C9A227;' }),
+            el('span', { style: 'flex:1;' }, [folder.name]),
+            el('span', { class: 'text-xs text-muted' }, ['(' + memberKeys.length + ')']),
+            el('button', { class: 'icon-btn btn-icon-only', title: 'Rename folder', style: 'width:22px;height:22px;', onclick: () => renameImportFolder(folder) }, [el('i', { class: 'fa-solid fa-pen', style: 'font-size:10px' })]),
+            el('button', { class: 'icon-btn btn-icon-only', title: 'Hapus folder (isi kembali ke Tanpa Folder)', style: 'width:22px;height:22px;', onclick: () => deleteImportFolder(folder) }, [el('i', { class: 'fa-solid fa-trash', style: 'font-size:10px' })]),
+          ]),
+          el('div', { class: 'layer-folder-body' + (expanded ? '' : ' hidden') }, memberKeys.length ? memberKeys.map(renderImportItem) : [el('p', { class: 'text-xs text-muted', style: 'padding:4px 8px;' }, ['Folder kosong — pindahkan layer ke sini lewat dropdown di tiap item.'])]),
+        ]));
+      });
+      const unassigned = importKeys.filter((k) => !importFolderAssign[k]);
+      unassigned.forEach((key) => importBody.appendChild(renderImportItem(key)));
+    }
+    tree.appendChild(el('div', { class: 'layer-folder' }, [
+      el('div', { class: 'layer-folder-header' }, [
+        el('i', { class: 'fa-solid ' + (layerTreeState.import ? 'fa-chevron-down' : 'fa-chevron-right'), style: 'width:12px;font-size:10px;cursor:pointer;', onclick: () => toggleFolder('import') }),
+        el('i', { class: 'fa-solid fa-folder-open', style: 'color:#C9A227;' }),
+        el('span', { style: 'font-weight:600;flex:1;' }, ['Data Import']),
+        el('span', { class: 'text-xs text-muted' }, ['(' + importKeys.length + ')']),
+        el('button', { class: 'icon-btn btn-icon-only', title: 'Buat folder baru', style: 'width:24px;height:24px;', onclick: createImportFolder }, [el('i', { class: 'fa-solid fa-folder-plus', style: 'font-size:11px' })]),
+      ]),
+      el('p', { class: 'text-xs text-muted layer-folder-desc' }, ['Hasil import KMZ/KML/GeoJSON/SHP — bebas dikelompokkan ke folder sendiri, tidak tersimpan ke database.']),
+      importBody,
+    ]));
+
+    // ---- FOLDER 2: Aset FTTH (per tipe, scoped ke Project Aktif, keterangan per folder) ----
+    const ftthBody = el('div', { class: 'layer-folder-body' + (layerTreeState.ftth ? '' : ' hidden') });
+    const scopeNote = App.currentProjectId ? ('Project: ' + (App.currentProjectName || '—')) : 'Semua Project (belum pilih Project Aktif)';
+    const metaEntries = Object.entries(CFG.ASSET_DEFS);
+    // Ambil jumlah baris tiap tipe sekali jalan (query ringan, head:true) supaya folder punya "keterangan" jumlah data.
+    const counts = {};
+    await Promise.all(metaEntries.map(async ([key, def]) => {
+      try {
+        let q = App.supabase.from(def.table).select('*', { count: 'exact', head: true });
+        q = scopeToProject(q, def.table);
+        const { count } = await q;
+        counts[key] = count || 0;
+      } catch (e) { counts[key] = 0; }
+    }));
+    metaEntries.forEach(([key, def]) => {
+      const meta = ASSET_FOLDER_META[key] || { icon: 'fa-layer-group', unit: '', desc: '' };
+      const displayTitle = labelFor('asset:' + key, def.title);
+      const expanded = !!layerTreeState.sub[key];
+      const checked = !!(App.assetLayerGroups[key] && App.map && App.map.hasLayer(App.assetLayerGroups[key]));
+      const subBody = el('div', { class: 'layer-folder-body' + (expanded ? '' : ' hidden') }, [
+        el('p', { class: 'text-xs text-muted layer-folder-desc' }, [meta.desc]),
+      ]);
+      ftthBody.appendChild(el('div', { class: 'layer-folder layer-subfolder' }, [
+        el('div', { class: 'layer-folder-header' }, [
+          el('i', { class: 'fa-solid ' + (expanded ? 'fa-chevron-down' : 'fa-chevron-right'), style: 'width:12px;font-size:10px;cursor:pointer;', onclick: () => toggleFolder(key) }),
+          el('input', { type: 'checkbox', checked: checked ? 'checked' : null, title: 'Tampilkan/sembunyikan di peta', onchange: async (e) => {
+            const lg = await loadAssetTypeLayer(key, def);
+            if (e.target.checked) App.map.addLayer(lg); else App.map.removeLayer(lg);
+          } }),
+          el('i', { class: 'fa-solid ' + meta.icon }),
+          el('span', { style: 'flex:1;' }, [displayTitle]),
+          el('span', { class: 'text-xs text-muted' }, ['(' + fmtNumber(counts[key]) + ' ' + meta.unit + ')']),
+          el('button', { class: 'icon-btn btn-icon-only', title: 'Rename folder', style: 'width:22px;height:22px;', onclick: () => renameLabel('asset:' + key, def.title) }, [el('i', { class: 'fa-solid fa-pen', style: 'font-size:10px' })]),
+        ]),
+        subBody,
+      ]));
     });
+    tree.appendChild(el('div', { class: 'layer-folder' }, [
+      el('div', { class: 'layer-folder-header', onclick: () => toggleFolder('ftth') }, [
+        el('i', { class: 'fa-solid ' + (layerTreeState.ftth ? 'fa-chevron-down' : 'fa-chevron-right'), style: 'width:12px;font-size:10px;' }),
+        el('i', { class: 'fa-solid fa-folder-open', style: 'color:#1F3A5F;' }),
+        el('span', { style: 'font-weight:600;' }, ['Aset FTTH']),
+      ]),
+      el('p', { class: 'text-xs text-muted layer-folder-desc' }, [scopeNote + ' — centang folder untuk tampilkan tipe aset di peta.']),
+      ftthBody,
+    ]));
+
+    listEl.appendChild(tree);
   }
 
   /* ================= [ASSETS] GENERIC CRUD MODULE FACTORY (FASE 2) ================= */
@@ -809,6 +1002,7 @@
       const from = (state.page - 1) * state.pageSize;
       const to = from + state.pageSize - 1;
       let query = App.supabase.from(def.table).select('*', { count: 'exact' }).order('created_at', { ascending: false }).range(from, to);
+      query = scopeToProject(query, def.table);
       const nameField = def.fields.find((f) => f.type === 'text')?.key || 'name';
       if (state.search) query = query.ilike(nameField, `%${state.search}%`);
 
@@ -989,10 +1183,14 @@
         if (existingRow) {
           ({ error } = await App.supabase.from(def.table).update(payload).eq('id', existingRow.id));
         } else {
+          // FIX #E5: tautkan data baru ke Project Aktif (kalau ada dipilih di topbar),
+          // supaya nanti muncul saat project itu difilter dan tidak ikut "nyasar" ke project lain.
+          if (App.currentProjectId && PROJECT_SCOPED_TABLES.includes(def.table)) payload.project_id = App.currentProjectId;
           ({ error } = await App.supabase.from(def.table).insert(payload));
         }
         if (error) throw error;
-        toast(def.title + ' berhasil disimpan.', 'success');
+        if (!existingRow && !App.currentProjectId) toast(def.title + ' tersimpan tanpa Project Aktif (belum tertaut ke project manapun).', 'info');
+        else toast(def.title + ' berhasil disimpan.', 'success');
         onDone();
         loadAndRenderTable();
       } catch (err) {
@@ -1044,14 +1242,16 @@
   // Mode "pilih lokasi di peta": pindah ke halaman Mapping, klik sekali di
   // peta untuk mengisi lat/lng pada form yang sedang terbuka.
   function pickLocationOnMap(onPick) {
-    toast('Silakan klik pada peta untuk memilih lokasi.', 'info', 4000);
+    const restoreModals = hideOpenModalsForMapPick();
+    toast('Silakan klik pada peta untuk memilih lokasi. Form akan muncul kembali otomatis.', 'info', 4000);
     location.hash = '#/mapping';
     const tryBind = () => {
       if (!App.map) { setTimeout(tryBind, 200); return; }
       const handler = (e) => {
         onPick(e.latlng.lat, e.latlng.lng);
         App.map.off('click', handler);
-        toast('Lokasi dipilih. Kembali membuka form...', 'success');
+        restoreModals();
+        toast('Lokasi dipilih. Form muncul kembali.', 'success');
       };
       App.map.on('click', handler);
     };
@@ -1070,8 +1270,8 @@
     const radius = CFG.COVERAGE.ODP_SERVICE_RADIUS_M;
     const limit = CFG.PERFORMANCE.MAP_PAGE_SIZE;
     const [{ data: odpRows, error: odpErr }, { data: homeRows, error: homeErr }] = await Promise.all([
-      App.supabase.from('odp').select('id, name, lat, lng').limit(limit),
-      App.supabase.from('homes').select('id, owner_name, address, lat, lng, odp_id').limit(limit),
+      scopeToProject(App.supabase.from('odp').select('id, name, lat, lng'), 'odp').limit(limit),
+      scopeToProject(App.supabase.from('homes').select('id, owner_name, address, lat, lng, odp_id'), 'homes').limit(limit),
     ]);
     if (odpErr || homeErr) throw new Error((odpErr || homeErr).message);
 
@@ -1831,17 +2031,20 @@
     projectState.rows.forEach((row) => {
       const badgeClass = PROJECT_STATUS_BADGE[row.status] || 'badge-neutral';
       const shortDesc = row.description ? (row.description.length > 60 ? row.description.slice(0, 60) + '…' : row.description) : '-';
+      const isActive = App.currentProjectId === row.id;
       tbody.appendChild(el('tr', {}, [
         el('td', {}, [
           el('a', {
             href: '#/project-detail?id=' + row.id,
             style: 'font-weight:600;color:var(--color-primary);text-decoration:none;cursor:pointer;',
           }, [row.name]),
+          isActive ? el('span', { class: 'badge badge-success', style: 'margin-left:8px;font-size:9px;' }, ['Aktif']) : null,
         ]),
         el('td', {}, [el('span', { class: 'badge ' + badgeClass }, [row.status || '-'])]),
         el('td', {}, [shortDesc]),
         el('td', {}, [fmtDate(row.created_at)]),
         el('td', {}, [
+          isActive ? null : el('button', { class: 'icon-btn btn-icon-only', title: 'Jadikan Project Aktif', onclick: () => setActiveProject(row.id, row.name) }, [el('i', { class: 'fa-solid fa-toggle-on', style: 'font-size:12px' })]),
           el('button', { class: 'icon-btn btn-icon-only', title: 'Buka Detail', onclick: () => { location.hash = '#/project-detail?id=' + row.id; } }, [el('i', { class: 'fa-solid fa-folder-open', style: 'font-size:12px' })]),
           el('button', { class: 'icon-btn btn-icon-only', title: 'Edit', onclick: () => openProjectForm(row) }, [el('i', { class: 'fa-solid fa-pen', style: 'font-size:12px' })]),
           el('button', { class: 'icon-btn btn-icon-only', title: 'Hapus', onclick: () => deleteProject(row) }, [el('i', { class: 'fa-solid fa-trash', style: 'font-size:12px;color:var(--color-danger)' })]),
@@ -1905,17 +2108,21 @@
     if (!name) { toast('Nama project wajib diisi.', 'warning'); return; }
     const payload = { name, status: statusInput.value, description: descInput.value.trim() || null };
     try {
-      let error;
+      let error, data;
       if (existingRow) {
         ({ error } = await App.supabase.from('projects').update(payload).eq('id', existingRow.id));
       } else {
         payload.created_by = (App.session && App.session.user) ? App.session.user.id : null;
-        ({ error } = await App.supabase.from('projects').insert(payload));
+        ({ data, error } = await App.supabase.from('projects').insert(payload).select().single());
       }
       if (error) throw error;
       toast('Project berhasil disimpan.', 'success');
       onDone();
-      loadAndRenderProjectTable();
+      // FIX #E5: project baru otomatis jadi "Project Aktif" -> semua menu (Dashboard,
+      // CRUD, dst.) langsung ter-filter ke project ini dan tampil 0 karena memang belum ada data.
+      if (!existingRow && data) setActiveProject(data.id, data.name);
+      if (typeof loadAndRenderProjectTable === 'function') loadAndRenderProjectTable();
+      if (typeof renderProjectSwitcher === 'function') renderProjectSwitcher();
     } catch (err) {
       toast('Gagal menyimpan project: ' + err.message, 'error');
     }
@@ -1930,7 +2137,50 @@
     const { error } = await App.supabase.from('projects').delete().eq('id', row.id);
     if (error) { toast('Gagal menghapus project: ' + error.message, 'error'); return; }
     toast('Project dihapus.', 'success');
+    if (App.currentProjectId === row.id) setActiveProject(null, null); // aktifnya ikut dihapus -> balik ke belum pilih
     loadAndRenderProjectTable();
+    renderProjectSwitcher();
+  }
+
+  // FIX #E5: switcher "Project Aktif" di topbar. Menampilkan project yang sedang
+  // aktif dan memungkinkan ganti/​buat project baru langsung dari halaman manapun.
+  async function renderProjectSwitcher() {
+    const host = $('#project-switcher');
+    if (!host || !App.supabase) return;
+    host.innerHTML = '';
+    let rows = [];
+    try {
+      const { data, error } = await App.supabase.from('projects').select('id,name').order('created_at', { ascending: false }).limit(200);
+      if (error) throw error;
+      rows = data || [];
+    } catch (e) { return; } // tabel belum ada / belum migrasi — diam saja, tidak mengganggu topbar
+
+    if (!rows.length) {
+      host.appendChild(el('button', {
+        class: 'btn btn-secondary btn-sm', title: 'Belum ada project — buat yang pertama',
+        onclick: () => openProjectForm(null),
+      }, [el('i', { class: 'fa-solid fa-plus' }), ' Project Baru']));
+      return;
+    }
+
+    // Kalau project aktif tersimpan sudah dihapus/tidak ada, reset ke belum-pilih.
+    if (App.currentProjectId && !rows.find((r) => r.id === App.currentProjectId)) {
+      App.currentProjectId = null; App.currentProjectName = null;
+      localStorage.removeItem('ma_active_project'); localStorage.removeItem('ma_active_project_name');
+    }
+
+    const select = el('select', { class: 'text-input', title: 'Project Aktif — memfilter Dashboard, CRUD, dan data lain di seluruh app' }, [
+      el('option', { value: '' }, ['— Semua Project (lama) —']),
+      ...rows.map((r) => el('option', { value: r.id }, [r.name])),
+    ]);
+    select.value = App.currentProjectId || '';
+    select.addEventListener('change', () => {
+      const row = rows.find((r) => r.id === select.value);
+      setActiveProject(select.value || null, row ? row.name : null);
+    });
+    const addBtn = el('button', { class: 'icon-btn', title: 'Tambah Project Baru', onclick: () => openProjectForm(null) }, [el('i', { class: 'fa-solid fa-plus' })]);
+    host.appendChild(select);
+    host.appendChild(addBtn);
   }
 
   /* ---- PROJECT DETAIL (route: #/project-detail?id=<uuid>) ---- */
@@ -1983,6 +2233,9 @@
             if (App._lastAnalysis) App._lastAnalysis.projectId = project.id; else App._lastAnalysis = { projectId: project.id };
             runAreaAnalysis(project.id);
           } }, [el('i', { class: 'fa-solid fa-wand-magic-sparkles' }), ' Analisa Area']),
+          App.currentProjectId === project.id
+            ? el('span', { class: 'badge badge-success', style: 'align-self:center;' }, ['Project Aktif'])
+            : el('button', { class: 'btn btn-secondary btn-sm', title: 'Jadikan project ini aktif di seluruh app', onclick: () => setActiveProject(project.id, project.name) }, [el('i', { class: 'fa-solid fa-toggle-on' }), ' Jadikan Aktif']),
           el('button', { class: 'btn btn-secondary btn-sm', onclick: () => openProjectForm(project) }, [el('i', { class: 'fa-solid fa-pen' }), ' Edit']),
           el('button', {
             class: 'btn btn-danger btn-sm',
@@ -2061,21 +2314,22 @@
     const engine = window.PlanningEngine || null;
     const meta = engine && typeof engine.describe === 'function' ? engine.describe() : null;
 
-    // Header: banner "Coming Soon"
+    // Header: status AKTIF (FIX #E3 — sebelumnya "Coming Soon" walau Wizard sudah bekerja).
     container.appendChild(el('div', { class: 'card empty-state' }, [
       el('i', { class: 'fa-solid fa-wand-magic-sparkles' }),
       el('h3', {}, [
         'Smart Planning ',
-        el('span', { class: 'badge badge-warning', style: 'margin-left:8px;vertical-align:middle;' }, ['Coming Soon']),
+        el('span', { class: 'badge badge-success', style: 'margin-left:8px;vertical-align:middle;' }, ['Aktif']),
       ]),
       el('p', { class: 'text-muted' }, [
-        'Modul Smart FTTH Planning (Auto Detect Building, Auto ODP/ODC/Backbone/Distribution/Tiang, ' +
-        'Auto BOQ & Proposal) sedang disiapkan. Saat ini baru tahap PONDASI (Implementation 01.5) — ' +
-        'belum dapat digunakan.',
+        'Auto Detect Building, Auto ODP/ODC (1:8 / 1:4), Auto Backbone/Distribution/Tiang, dan Auto BOQ & Proposal ' +
+        'sudah aktif melalui Smart Planning Wizard (Import → Analisa Area → Generate → Review → Approval).',
       ]),
       el('p', { class: 'text-xs text-muted' }, [
-        'Planning Engine: ' + (engine ? ('v' + engine.version + ' — status: stub (belum aktif)') : 'belum termuat (planning-engine.js).'),
+        'Planning Engine (fondasi): ' + (engine ? ('v' + engine.version) : 'belum termuat') +
+        ' · Logika auto-analisa & auto-generate berjalan lewat planning-analyzers.js / planning-generators.js.',
       ]),
+      el('button', { class: 'btn btn-primary btn-sm', style: 'margin-top:10px;', onclick: () => { location.hash = '#/planning-wizard?step=1'; } }, [el('i', { class: 'fa-solid fa-arrow-right' }), ' Buka Smart Planning Wizard']),
     ]));
 
     // Daftar service Planning Engine (read-only) — memakai class tabel yang sudah ada.
@@ -2121,30 +2375,23 @@
   function injectSmartPlanningNav() {
     const nav = $('#sidebar-nav');
     if (!nav) return;
-    // BUGFIX: sebelumnya baris ini `return` total kalau menu "smart-planning" sudah
-    // ada dari config.js (NAV_GROUPS) — akibatnya SELURUH grup "Smart FTTH" di bawah
-    // (Planning Wizard, Planning Summary, Detected Buildings, dst) tidak pernah
-    // ditambahkan. Sekarang hanya melewati pembuatan item disabled duplikat ini,
-    // proses lanjut ke item-item lain di bawah (masing-masing sudah ada guard sendiri).
-    const smartPlanningAlreadyExists = !!nav.querySelector('[data-route="smart-planning"]');
-    if (nav.querySelector('[data-route="planning-wizard"]') && smartPlanningAlreadyExists) return; // grup sudah pernah diinjeksi sebelumnya, aman skip semua.
+    // Jangan duplikasi bila route ini sudah punya nav-item (mis. dari config.js).
+    if (nav.querySelector('[data-route="smart-planning"]')) return;
 
-    const item = smartPlanningAlreadyExists ? null : el('div', {
-      class: 'nav-item nav-item-disabled',
+    const item = el('div', {
+      class: 'nav-item',
       'data-route': 'smart-planning',
-      title: 'Smart Planning — Coming Soon (belum dapat digunakan)',
-      style: 'opacity:0.55;cursor:not-allowed;justify-content:space-between;',
+      title: 'Smart Planning — Auto Analisa & Auto Generate (buka Wizard)',
     }, [
       el('span', { style: 'display:inline-flex;align-items:center;gap:10px;' }, [
         el('i', { class: 'fa-solid fa-wand-magic-sparkles' }),
         el('span', { class: 'nav-item-label' }, ['Smart Planning']),
       ]),
-      el('span', { class: 'badge badge-warning', style: 'font-size:9px;padding:2px 6px;' }, ['Soon']),
     ]);
-    if (item) item.addEventListener('click', (e) => {
-      e.preventDefault();
-      if (App.toast) App.toast('Smart Planning masih Coming Soon — belum dapat digunakan.', 'info');
-    });
+    // FIX #E3: engine otomatis (analisa area + auto ODP/ODC/backbone/BOQ) SUDAH aktif
+    // lewat Planning Wizard. Item ini dulunya disabled & hanya menampilkan toast
+    // "Coming Soon" — sekarang mengarah langsung ke Wizard supaya tidak membingungkan.
+    item.addEventListener('click', () => { location.hash = '#/planning-wizard?step=1'; });
 
     // Menu "Planning Summary" (AKTIF sejak Implementation 02 Phase 1 — Analisa Area).
     const summaryItem = el('div', {
@@ -2187,7 +2434,7 @@
     const group = el('div', { class: 'nav-group' }, [
       el('div', { class: 'nav-group-title' }, ['Smart FTTH']),
     ]);
-    if (item) group.appendChild(item);
+    group.appendChild(item);
     if (!nav.querySelector('[data-route="detected-buildings"]')) group.appendChild(detectedItem);
     if (!nav.querySelector('[data-route="planning-wizard"]')) group.appendChild(wizardItem);
     if (!nav.querySelector('[data-route="planning-summary"]')) group.appendChild(summaryItem);
@@ -2330,46 +2577,6 @@
   }
   App.saveDetectedBuildings = saveDetectedBuildings;
 
-  // Konversi detected_buildings -> homes (Rumah). ADDITIF: tidak menghapus/mengubah
-  // form CRUD Rumah biasa — hasil konversi cuma jadi baris `homes` normal yang tetap
-  // bisa diedit manual (nama pemilik, alamat, status, lat/lng) lewat menu Rumah.
-  // Mencegah duplikasi lewat kolom homes.source_building_id (migration 012).
-  async function convertBuildingsToHomes(buildings) {
-    if (!buildings || !buildings.length) return { created: 0, skipped: 0, error: null };
-    const ids = buildings.map((b) => b.id);
-    let already = {};
-    try {
-      const { data, error } = await App.supabase.from('homes').select('source_building_id').in('source_building_id', ids);
-      if (error) throw error;
-      (data || []).forEach((h) => { if (h.source_building_id) already[h.source_building_id] = true; });
-    } catch (e) {
-      // Kolom source_building_id belum ada (migration 012 belum jalan) — beri tahu, jangan lanjut insert
-      // supaya tidak dobel tiap kali tombol dipencet.
-      return { created: 0, skipped: buildings.length, error: 'Jalankan migration_012_homes_from_detected.sql dulu di Supabase.' };
-    }
-    const toCreate = buildings.filter((b) => !already[b.id] && b.lat != null && b.lng != null);
-    if (!toCreate.length) return { created: 0, skipped: buildings.length, error: null };
-    const rows = toCreate.map((b) => ({
-      owner_name: '(Belum diisi — ' + (b.building_id || ('Bangunan ' + String(b.id).slice(0, 8))) + ')',
-      address: null,
-      status: 'Prospek',
-      lat: Number(b.lat), lng: Number(b.lng),
-      source_building_id: b.id, source_kind: 'detected_buildings',
-    }));
-    let created = 0;
-    try {
-      for (let i = 0; i < rows.length; i += 500) {
-        const { error } = await App.supabase.from('homes').insert(rows.slice(i, i + 500));
-        if (error) throw error;
-        created += Math.min(500, rows.length - i);
-      }
-    } catch (err) {
-      return { created, skipped: buildings.length - created, error: err.message };
-    }
-    return { created, skipped: buildings.length - created, error: null };
-  }
-  App.convertBuildingsToHomes = convertBuildingsToHomes;
-
   // Entry point tombol "Analisa Area". projectId opsional.
   async function runAreaAnalysis(projectId) {
     const out = await performBoundaryAnalysis(projectId);
@@ -2487,37 +2694,6 @@
       el('div', { class: 'card-header' }, [el('h3', {}, ['Detail Analisa'])]),
       el('div', { class: 'table-wrap' }, [infoTable]),
     ]));
-
-    // ---- Buat Data Rumah otomatis dari hasil deteksi (additif, tidak menghapus form manual) ----
-    if (analysis.id) {
-      const homesCard = el('div', { class: 'card', style: 'margin-top:16px;' }, [
-        el('div', { class: 'card-header' }, [el('h3', {}, ['Data Rumah dari Hasil Deteksi'])]),
-        el('p', { class: 'text-muted', style: 'margin:0 0 10px;' }, [
-          'Buat baris Rumah otomatis (lat/lng terisi) dari bangunan kategori "Rumah" hasil Analisa Area ini. ' +
-          'Nama pemilik & alamat akan kosong/placeholder — tetap bisa diisi/diedit manual lewat menu Rumah seperti biasa. ' +
-          'Aman dijalankan berkali-kali, bangunan yang sudah pernah dikonversi tidak akan dobel.',
-        ]),
-        el('button', {
-          class: 'btn btn-primary btn-sm', onclick: async (e) => {
-            const btn = e.currentTarget; btn.disabled = true;
-            toast('Membuat data Rumah dari hasil deteksi...', 'info');
-            let bld = [];
-            try {
-              const { data, error } = await App.supabase.from('detected_buildings').select('id,building_id,lat,lng,category').eq('analysis_id', analysis.id).eq('category', 'Rumah').neq('status', 'removed');
-              if (error) throw error;
-              bld = data || [];
-            } catch (err) { toast('Detected Buildings belum tersedia (jalankan migration 008 & analisa ulang).', 'warning', 5000); btn.disabled = false; return; }
-            if (!bld.length) { toast('Tidak ada bangunan kategori Rumah untuk analisa ini.', 'warning', 4000); btn.disabled = false; return; }
-            const res = await App.convertBuildingsToHomes(bld);
-            if (res.error) { toast(res.error, 'error', 6000); }
-            else { toast(res.created + ' Rumah baru dibuat' + (res.skipped ? ', ' + res.skipped + ' sudah ada sebelumnya' : '') + '. Buka menu Rumah untuk lihat/edit manual.', 'success', 6000); }
-            btn.disabled = false;
-          },
-        }, [el('i', { class: 'fa-solid fa-house-circle-check' }), ' Buat Data Rumah dari Deteksi']),
-        el('button', { class: 'btn btn-secondary btn-sm', style: 'margin-left:8px;', onclick: () => { location.hash = '#/homes'; } }, [el('i', { class: 'fa-solid fa-house' }), ' Buka Menu Rumah']),
-      ]);
-      container.appendChild(homesCard);
-    }
 
     // ---- Peta hasil dengan layer yang dapat diaktif/nonaktifkan ----
     const mapCard = el('div', { class: 'card', style: 'margin-top:16px;' }, [
@@ -3222,6 +3398,87 @@
   }
   App.planningFinalHelpers = { createPlanningVersion, transitionStatus, saveValidation, loadVersions, loadVersionById };
 
+  // FIX #E7 (audit "serba otomatis"): sebelumnya, snapshot hasil Wizard
+  // (ODC/ODP/Tiang/Rumah/Backbone/Distribution) hanya tersimpan sebagai JSON
+  // di planning_version.snapshot — TIDAK PERNAH otomatis menjadi baris asli
+  // di tabel operasional (odc/odp/homes/poles/backbones/distributions) yang
+  // dipakai Asset Management/Mapping/Dashboard. Planner harus input ulang
+  // manual satu-satu. Fungsi ini menutup gap tsb: sekali klik, seluruh
+  // snapshot "dideploy" jadi data asli, lengkap dengan relasi ODC↔ODP↔Rumah
+  // dan panjang jalur Backbone/Distribution.
+  async function deployVersionToAssets(version) {
+    if (version.status !== 'final') { toast('Hanya versi dengan status "final" yang boleh di-deploy ke Implementasi.', 'warning'); return; }
+    if (version.deployed_at) {
+      const ok = await confirmDialog('Versi ini sudah pernah di-deploy pada ' + fmtDate(version.deployed_at) + '. Deploy ulang akan MENAMBAH data baru (bukan menimpa/replace), berpotensi duplikat. Lanjutkan?', 'Deploy Ulang?');
+      if (!ok) return;
+    }
+    const snap = version.snapshot || {};
+    if (!(snap.odcs && snap.odcs.length) && !(snap.odps && snap.odps.length)) { toast('Snapshot versi ini kosong/tidak lengkap, tidak bisa di-deploy.', 'error'); return; }
+    const projectId = version.project_id || null;
+    const summary = { odc: 0, odp: 0, pole: 0, home: 0, backbone: 0, distribution: 0 };
+    const errors = [];
+    toast('Deploy ke Implementasi dimulai — mohon tunggu, jangan tutup halaman…', 'info', 5000);
+    try {
+      // 1) ODC dulu (paling induk).
+      const odcIdMap = {};
+      for (const o of (snap.odcs || [])) {
+        const { data, error } = await App.supabase.from('odc').insert({ name: o.odc_id, lat: o.lat, lng: o.lng, project_id: projectId }).select().single();
+        if (error) { errors.push('ODC ' + o.odc_id + ': ' + error.message); continue; }
+        odcIdMap[o.odc_id] = data.id; summary.odc++;
+      }
+      // 2) ODP, ditautkan ke ODC induk lewat odc.odp_ids (hasil clustering Wizard).
+      const odpIdMap = {};
+      for (const p of (snap.odps || [])) {
+        const parentOdc = (snap.odcs || []).find((o) => (o.odp_ids || []).includes(p.odp_id));
+        const { data, error } = await App.supabase.from('odp').insert({ name: p.odp_id, odc_id: parentOdc ? (odcIdMap[parentOdc.odc_id] || null) : null, lat: p.lat, lng: p.lng, project_id: projectId }).select().single();
+        if (error) { errors.push('ODP ' + p.odp_id + ': ' + error.message); continue; }
+        odpIdMap[p.odp_id] = data.id; summary.odp++;
+      }
+      // 3) Tiang (poles) sepanjang jalur kabel.
+      const poleList = (snap.poles && snap.poles.points) || [];
+      if (poleList.length) {
+        const { error } = await App.supabase.from('poles').insert(poleList.map((pl) => ({ code: pl.pole_id, lat: pl.lat, lng: pl.lng, project_id: projectId })));
+        if (error) errors.push('Tiang: ' + error.message); else summary.pole = poleList.length;
+      }
+      // 4) Rumah (dari hasil drop cable ODP -> Rumah).
+      const dropRecords = (snap.drop && snap.drop.records) || [];
+      if (dropRecords.length) {
+        const { error } = await App.supabase.from('homes').insert(dropRecords.map((r) => ({
+          owner_name: 'Homepass ' + r.building_id, address: null, status: 'Prospek',
+          odp_id: odpIdMap[r.odp_id] || null, lat: r.lat, lng: r.lng, project_id: projectId,
+        })));
+        if (error) errors.push('Rumah: ' + error.message); else summary.home = dropRecords.length;
+      }
+      // 5) Backbone (POP -> ODC).
+      const bbFeats = (snap.backbone && snap.backbone.featureCollection && snap.backbone.featureCollection.features) || [];
+      for (let i = 0; i < bbFeats.length; i++) {
+        let lenM = 0; try { lenM = Math.round(window.turf.length(bbFeats[i], { units: 'kilometers' }) * 1000); } catch (e) {}
+        const { error } = await App.supabase.from('backbones').insert({ name: 'Backbone-' + (i + 1), path: geometryToWKT(bbFeats[i].geometry), length_m: lenM, project_id: projectId });
+        if (error) errors.push('Backbone-' + (i + 1) + ': ' + error.message); else summary.backbone++;
+      }
+      // 6) Distribution (ODC -> ODP), ditautkan ke ODC/ODP asli lewat properti kind pada feature.
+      const distFeats = (snap.distribution && snap.distribution.featureCollection && snap.distribution.featureCollection.features) || [];
+      for (let i = 0; i < distFeats.length; i++) {
+        const props = distFeats[i].properties || {};
+        let lenM = 0; try { lenM = Math.round(window.turf.length(distFeats[i], { units: 'kilometers' }) * 1000); } catch (e) {}
+        const { error } = await App.supabase.from('distributions').insert({
+          name: 'Distribution-' + (i + 1), odc_id: odcIdMap[props.odc] || null, odp_id: odpIdMap[props.odp] || null,
+          path: geometryToWKT(distFeats[i].geometry), length_m: lenM, project_id: projectId,
+        });
+        if (error) errors.push('Distribution-' + (i + 1) + ': ' + error.message); else summary.distribution++;
+      }
+      try { await App.supabase.from('planning_version').update({ deployed_at: new Date().toISOString(), deployed_summary: summary }).eq('id', version.id); } catch (e) {}
+      version.deployed_at = new Date().toISOString();
+      await logHistory({ project_id: projectId, version_id: version.id, entity: 'deploy', action: 'deploy_to_assets',
+        description: 'Deploy ke Implementasi — ODC ' + summary.odc + ', ODP ' + summary.odp + ', Tiang ' + summary.pole + ', Rumah ' + summary.home + ', Backbone ' + summary.backbone + ', Distribution ' + summary.distribution + (errors.length ? (' (' + errors.length + ' error)') : '') });
+      if (errors.length) { console.warn('[Deploy ke Implementasi]', errors); toast('Deploy selesai dengan ' + errors.length + ' error — pastikan migration 013 (deployed_at/deployed_summary) sudah dijalankan. Detail di console.', 'warning', 7000); }
+      else toast('Deploy sukses! ODC ' + summary.odc + ' · ODP ' + summary.odp + ' · Tiang ' + summary.pole + ' · Rumah ' + summary.home + ' · Backbone ' + summary.backbone + ' · Distribution ' + summary.distribution + '. Cek di menu Asset Management / Mapping.', 'success', 8000);
+    } catch (err) {
+      toast('Deploy gagal: ' + err.message, 'error');
+    }
+  }
+  App.deployVersionToAssets = deployVersionToAssets;
+
   // ---------- MODULE: PLANNING VERSIONS ----------
   ROUTE_TITLES['planning-versions'] = 'Planning Versions';
   registerModule('planning-versions', async function renderVersions(container) {
@@ -3250,7 +3507,12 @@
         el('td', {}, [fmtNumber(v.home_passed)]), el('td', {}, [fmtNumber(v.odp_count)]), el('td', {}, [fmtNumber(v.odc_count)]),
         el('td', {}, [String(v.coverage_percent != null ? v.coverage_percent : '-')]),
         el('td', { class: 'text-xs text-muted' }, [fmtDate ? fmtDate(v.created_at) : String(v.created_at || '').slice(0, 10)]),
-        el('td', {}, [el('div', { style: 'display:flex;gap:6px;' }, [
+        el('td', {}, [el('div', { style: 'display:flex;gap:6px;flex-wrap:wrap;' }, [
+          v.status === 'final' ? (
+            v.deployed_at
+              ? el('span', { class: 'badge badge-success', title: 'Sudah di-deploy: ' + fmtDate(v.deployed_at) }, [el('i', { class: 'fa-solid fa-circle-check' }), ' Ter-deploy'])
+              : el('button', { class: 'btn btn-primary btn-sm', title: 'Ubah snapshot planning ini jadi data Asset asli (ODC/ODP/Rumah/Tiang/Backbone/Distribution)', onclick: async (e) => { e.target.disabled = true; await deployVersionToAssets(v); navigateTo('planning-versions'); } }, [el('i', { class: 'fa-solid fa-rocket' }), ' Deploy ke Implementasi'])
+          ) : null,
           el('button', { class: 'btn btn-ghost btn-sm', title: 'Validasi/Approval', onclick: () => { location.hash = '#/planning-validation?version=' + v.id; } }, [el('i', { class: 'fa-solid fa-clipboard-check' })]),
           el('button', { class: 'btn btn-ghost btn-sm', title: 'Reports', onclick: () => { location.hash = '#/planning-reports?version=' + v.id; } }, [el('i', { class: 'fa-solid fa-file-lines' })]),
           el('button', { class: 'btn btn-ghost btn-sm', title: 'Restore — buat versi baru dari snapshot ini', onclick: async () => {
@@ -3687,11 +3949,6 @@
     const rows = await loadDetectedBuildings({ analysisId });
     if (rows === null) { container.appendChild(el('div', { class: 'card empty-state' }, [el('i', { class: 'fa-solid fa-triangle-exclamation' }), el('h3', {}, ['Tabel belum tersedia']), el('p', { class: 'text-muted' }, ['Jalankan migration 008_detected_buildings.sql lalu analisa ulang.'])])); return; }
     st.rows = rows;
-    st.homeMap = {}; // building_id -> true kalau sudah pernah dikonversi jadi Rumah
-    try {
-      const { data } = await App.supabase.from('homes').select('source_building_id').in('source_building_id', rows.map((r) => r.id));
-      (data || []).forEach((h) => { if (h.source_building_id) st.homeMap[h.source_building_id] = true; });
-    } catch (e) { /* migration 012 belum jalan — badge "Jadikan Rumah" tetap tampil, tombol akan kasih pesan */ }
 
     // Toolbar.
     const searchIn = el('input', { class: 'text-input', placeholder: 'Cari Building ID / kategori...', style: 'max-width:220px;', oninput: (e) => { st.search = e.target.value.trim().toLowerCase(); st.page = 1; paint(); } });
@@ -3713,7 +3970,6 @@
       el('button', { class: 'btn btn-primary btn-sm', onclick: addBuilding }, [el('i', { class: 'fa-solid fa-plus' }), ' Tambah']),
       el('button', { class: 'btn btn-secondary btn-sm', onclick: mergeSelected }, [el('i', { class: 'fa-solid fa-object-group' }), ' Merge terpilih']),
       el('button', { class: 'btn btn-secondary btn-sm', onclick: splitSelected }, [el('i', { class: 'fa-solid fa-object-ungroup' }), ' Split terpilih']),
-      el('button', { class: 'btn btn-secondary btn-sm', onclick: convertSelectedToHomes }, [el('i', { class: 'fa-solid fa-house-circle-check' }), ' Jadikan Rumah (terpilih)']),
       el('button', { class: 'btn btn-danger btn-sm', onclick: deleteSelected }, [el('i', { class: 'fa-solid fa-trash' }), ' Hapus terpilih']),
     ]);
 
@@ -3783,7 +4039,7 @@
 
       tableWrap.innerHTML = '';
       const table = el('table', { class: 'data-table' }, [
-        el('thead', {}, [el('tr', {}, ['', 'No', 'Building ID', 'Lat', 'Lng', 'Area', 'Perimeter', 'Kategori', 'Confidence', 'Status', 'Rumah', 'Planner', 'Tanggal'].map((h) => el('th', {}, [h])))]),
+        el('thead', {}, [el('tr', {}, ['', 'No', 'Building ID', 'Lat', 'Lng', 'Area', 'Perimeter', 'Kategori', 'Confidence', 'Status', 'Planner', 'Tanggal'].map((h) => el('th', {}, [h])))]),
         el('tbody', {}, pageRows.map((r, i) => {
           const cb = el('input', { type: 'checkbox', onclick: (e) => { e.stopPropagation(); if (e.target.checked) st.selected[r.id] = true; else delete st.selected[r.id]; } });
           if (st.selected[r.id]) cb.setAttribute('checked', 'checked');
@@ -3798,7 +4054,6 @@
             el('td', {}, [el('span', { class: 'badge badge-neutral' }, [r.category || '-'])]),
             el('td', {}, [String(r.confidence != null ? r.confidence : '-')]),
             el('td', {}, [el('span', { class: 'badge badge-' + (r.status === 'detected' ? 'info' : (r.status === 'removed' ? 'danger' : 'success')) }, [r.status || '-'])]),
-            el('td', {}, [st.homeMap[r.id] ? el('span', { class: 'badge badge-success', title: 'Sudah ada baris Rumah dari bangunan ini' }, ['✓ Rumah']) : el('span', { class: 'text-xs text-muted' }, ['-'])]),
             el('td', { class: 'text-xs' }, [r.planner || '-']),
             el('td', { class: 'text-xs text-muted' }, [String(r.created_at || '').slice(0, 10)]),
           ]);
@@ -3836,9 +4091,6 @@
           el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { zoomTo(r); } }, [el('i', { class: 'fa-solid fa-magnifying-glass-plus' }), ' Zoom']),
           el('button', { class: 'btn btn-secondary btn-sm', onclick: () => duplicateBuilding(r) }, [el('i', { class: 'fa-solid fa-clone' }), ' Duplicate']),
           el('button', { class: 'btn btn-secondary btn-sm', onclick: () => splitBuilding(r) }, [el('i', { class: 'fa-solid fa-object-ungroup' }), ' Split']),
-          st.homeMap[r.id]
-            ? el('button', { class: 'btn btn-secondary btn-sm', disabled: 'disabled', title: 'Sudah ada baris Rumah dari bangunan ini' }, [el('i', { class: 'fa-solid fa-house-circle-check' }), ' Sudah jadi Rumah'])
-            : el('button', { class: 'btn btn-secondary btn-sm', onclick: () => convertSelectedToHomes([r]) }, [el('i', { class: 'fa-solid fa-house-circle-check' }), ' Jadikan Rumah']),
           el('button', { class: 'btn btn-danger btn-sm', onclick: () => deleteBuilding(r) }, [el('i', { class: 'fa-solid fa-trash' }), ' Hapus']),
         ]),
       ]));
@@ -3895,45 +4147,14 @@
       if (d) { try { await App.supabase.from('detected_buildings').delete().in('id', ids); } catch (e) {} afterChange(ids.length + ' bangunan digabung'); }
     }
     async function splitSelected() { const ids = Object.keys(st.selected); if (ids.length !== 1) { toast('Pilih tepat 1 bangunan untuk split.', 'info'); return; } const r = st.rows.find((x) => x.id === ids[0]); if (r) splitBuilding(r); }
-    // Jadikan Rumah — additif, tidak menghapus kemampuan isi/edit manual di menu Rumah.
-    async function convertSelectedToHomes(explicitRows) {
-      const list = explicitRows || Object.keys(st.selected).map((id) => st.rows.find((x) => x.id === id)).filter(Boolean);
-      if (!list.length) { toast('Pilih baris dulu (checkbox), atau klik "Jadikan Rumah" di detail bangunan.', 'info'); return; }
-      toast('Membuat data Rumah...', 'info');
-      const res = await App.convertBuildingsToHomes(list);
-      if (res.error) { toast(res.error, 'error', 6000); return; }
-      toast(res.created + ' Rumah baru dibuat' + (res.skipped ? ', ' + res.skipped + ' sudah ada sebelumnya' : '') + '. Bisa diedit manual di menu Rumah.', 'success', 5000);
-      const fresh = { ...st.homeMap };
-      list.forEach((r) => { fresh[r.id] = true; });
-      st.homeMap = fresh; st.selected = {}; paint(); if (st.detail) renderDetail();
-    }
 
     paint();
   }, function destroyDetected() { if (App.detectedMap) { try { App.detectedMap.remove(); } catch (e) {} App.detectedMap = null; } });
 
   // Kategori bangunan yang dapat diklik di Dashboard (Revision 01, Perubahan 9).
-  // Kartu "Bangunan Terdeteksi" di Dashboard — HANYA menghitung analisa TERBARU
-  // per project (bukan akumulasi seluruh riwayat setiap kali "Analisa Area"
-  // dijalankan ulang), supaya angkanya mencerminkan kondisi project saat ini.
   async function injectBuildingCategories(container) {
-    let analyses = [];
-    try {
-      const { data, error } = await App.supabase.from('planning_analysis').select('id, project_id, analyzed_at').order('analyzed_at', { ascending: false });
-      if (error) throw error;
-      analyses = data || [];
-    } catch (e) { return; }
-    if (!analyses.length) return;
-    // Ambil 1 analisa terbaru saja per project (project_id null dianggap 1 grup tersendiri).
-    const latestPerProject = {};
-    analyses.forEach((a) => { const key = a.project_id || '__tanpa_project__'; if (!(key in latestPerProject)) latestPerProject[key] = a.id; });
-    const analysisIds = Object.values(latestPerProject);
-
     let rows = [];
-    try {
-      const { data, error } = await App.supabase.from('detected_buildings').select('category').in('analysis_id', analysisIds).neq('status', 'removed');
-      if (error) throw error;
-      rows = data || [];
-    } catch (e) { return; }
+    try { const { data } = await App.supabase.from('detected_buildings').select('category'); rows = data || []; } catch (e) { return; }
     if (!rows.length) return;
     const counts = { Rumah: 0, Ruko: 0, Gedung: 0, Apartemen: 0, Lainnya: 0 };
     rows.forEach((r) => { counts[r.category] = (counts[r.category] || 0) + 1; });
@@ -3943,11 +4164,7 @@
       card.addEventListener('click', () => { location.hash = '#/detected-buildings?category=' + encodeURIComponent(c); });
       return card;
     }));
-    container.appendChild(el('div', { class: 'card', style: 'margin-top:16px;' }, [
-      el('div', { class: 'card-header' }, [el('h3', {}, ['Bangunan Terdeteksi (klik untuk daftar)'])]),
-      el('p', { class: 'text-muted', style: 'margin:-6px 0 10px;' }, ['Dihitung dari analisa TERBARU tiap project — bukan akumulasi semua riwayat Analisa Area.']),
-      grid,
-    ]));
+    container.appendChild(el('div', { class: 'card', style: 'margin-top:16px;' }, [el('div', { class: 'card-header' }, [el('h3', {}, ['Bangunan Terdeteksi (klik untuk daftar)'])]), grid]));
   }
   App.injectBuildingCategories = injectBuildingCategories;
 
@@ -3993,7 +4210,9 @@
     const out = []; let truncated = false;
     await Promise.all(ASSET_DEFS.map(async (def) => {
       try {
-        const { data, error } = await App.supabase.from(def.table).select('id,' + def.nameCol + ',lat,lng,asset_status,project_id').limit(ASSET_FETCH_LIMIT);
+        let q = App.supabase.from(def.table).select('id,' + def.nameCol + ',lat,lng,asset_status,project_id').limit(ASSET_FETCH_LIMIT);
+        q = scopeToProject(q, def.table); // FIX #E9: ikut Project Aktif
+        const { data, error } = await q;
         if (error || !data) return;
         if (data.length >= ASSET_FETCH_LIMIT) truncated = true;
         data.forEach((r) => out.push({ asset_type: def.type, id: r.id, name: r[def.nameCol], lat: r.lat, lng: r.lng, asset_status: r.asset_status || 'draft', project_id: r.project_id }));
@@ -4006,7 +4225,9 @@
     const out = []; let truncated = false;
     await Promise.all(LINE_ASSET_DEFS.map(async (def) => {
       try {
-        const { data, error } = await App.supabase.from(def.table).select('id,' + def.nameCol + ',asset_status,project_id,length_m').limit(ASSET_FETCH_LIMIT);
+        let q = App.supabase.from(def.table).select('id,' + def.nameCol + ',asset_status,project_id,length_m').limit(ASSET_FETCH_LIMIT);
+        q = scopeToProject(q, def.table); // FIX #E9: ikut Project Aktif
+        const { data, error } = await q;
         if (error || !data) return;
         if (data.length >= ASSET_FETCH_LIMIT) truncated = true;
         data.forEach((r) => out.push({ asset_type: def.type, id: r.id, name: r[def.nameCol], asset_status: r.asset_status || 'draft', project_id: r.project_id, length_m: r.length_m }));
@@ -4058,6 +4279,28 @@
     await logAssetChange({ project_id: asset.project_id, asset_type: asset.asset_type, asset_id: asset.id, change_type: 'status_change', old_value: { asset_status: old }, new_value: { asset_status: newStatus } });
     asset.asset_status = newStatus;
     toast('Status aset diperbarui.', 'success');
+    // FIX #E10 (audit "serba otomatis"): sebelumnya status tiap Rumah/ODP harus
+    // diubah manual satu-satu meski secara fisik mereka 1 paket pekerjaan
+    // (mis. ODP selesai dipasang -> semua Rumah di ODP itu juga logisnya
+    // "Terpasang"). Sekarang begitu status ODC/ODP berubah ke status lapangan
+    // (installed/verified/maintenance/removed), sistem otomatis tawarkan
+    // cascade ke aset turunannya — cukup 1 klik konfirmasi, bukan input ulang.
+    if (['installed', 'verified', 'maintenance', 'removed'].includes(newStatus)) {
+      if (asset.asset_type === 'odp') await cascadeStatusToChildren('homes', 'odp_id', asset.id, newStatus, 'Rumah');
+      else if (asset.asset_type === 'odc') await cascadeStatusToChildren('odp', 'odc_id', asset.id, newStatus, 'ODP');
+    }
+  }
+  async function cascadeStatusToChildren(table, fkCol, parentId, newStatus, label) {
+    try {
+      const { data, error } = await App.supabase.from(table).select('id').eq(fkCol, parentId);
+      if (error || !data || !data.length) return;
+      const ok = await confirmDialog('Ada ' + data.length + ' ' + label + ' yang terhubung ke aset ini. Ikut ubah status jadi "' + newStatus + '" juga?', 'Cascade Status Otomatis');
+      if (!ok) return;
+      const { error: updErr } = await App.supabase.from(table).update({ asset_status: newStatus }).eq(fkCol, parentId);
+      if (updErr) { toast('Gagal cascade status: ' + updErr.message, 'error'); return; }
+      await logAssetChange({ asset_type: table === 'homes' ? 'home' : 'odp', asset_id: parentId, change_type: 'cascade_status', new_value: { asset_status: newStatus, count: data.length } });
+      toast(data.length + ' ' + label + ' ikut diperbarui otomatis ke "' + newStatus + '".', 'success', 5000);
+    } catch (e) { /* tabel/kolom belum siap — diamkan, tidak mengganggu update utama */ }
   }
   async function updateAssetLocation(asset, newLat, newLng, note, reason, changeType) {
     const def = assetDef(asset.asset_type); if (!def) return false;
@@ -4080,6 +4323,27 @@
       return;
     }
     const state = { q: '', type: '', status: '', selected: null };
+
+    // FIX #E10 (audit "serba otomatis"): tool update massal — sebelumnya untuk
+    // menandai semua Rumah di 1 ODP jadi "Terpasang" harus buka tiap baris
+    // Rumah satu-satu. Sekarang cukup pilih ODP + status tujuan, 1 klik.
+    const odpOptions = points.filter((p) => p.asset_type === 'odp');
+    if (odpOptions.length) {
+      const odpSelect = el('select', { class: 'text-input', style: 'max-width:220px;' }, odpOptions.map((o) => el('option', { value: o.id }, [o.name || o.id])));
+      const statusSelect = el('select', { class: 'text-input', style: 'max-width:160px;' }, window.PlanningFinal.ASSET_STATUS_ORDER.map((s) => el('option', { value: s }, [s])));
+      container.appendChild(el('div', { class: 'card' }, [
+        el('div', { class: 'card-header' }, [el('h3', {}, ['Update Massal Status Rumah per ODP'])]),
+        el('p', { class: 'text-xs text-muted' }, ['Terapkan 1 status ke SEMUA rumah yang terhubung ke 1 ODP sekaligus — tidak perlu ubah satu-satu.']),
+        el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;align-items:center;' }, [
+          odpSelect, statusSelect,
+          el('button', { class: 'btn btn-primary btn-sm', onclick: async () => {
+            await cascadeStatusToChildren('homes', 'odp_id', odpSelect.value, statusSelect.value, 'Rumah');
+            renderList();
+          } }, [el('i', { class: 'fa-solid fa-arrows-turn-right' }), ' Terapkan ke Semua Rumah di ODP ini']),
+        ]),
+      ]));
+    }
+
     const filterCard = el('div', { class: 'card' }, [
       el('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;align-items:center;' }, [
         el('input', { type: 'text', placeholder: 'Cari nama/kode/lat/lng/project...', class: 'text-input', style: 'flex:1;min-width:180px;', oninput: (e) => { state.q = e.target.value; renderList(); } }),
@@ -4217,28 +4481,55 @@
     renderList();
   });
 
-  // ---------- GLOBAL MAP (semua project, semua layer) ----------
+  // ---------- GLOBAL MAP ----------
+  // FIX #E9: sebelumnya selalu lintas-project (pakai loadAllPointAssets() yang
+  // sekarang otomatis ikut Project Aktif). Ditambah toggle eksplisit supaya
+  // yang butuh tampilan lintas-project (mis. overview semua project) tetap bisa.
   registerModule('global-map', async function renderGlobalMap(container) {
     container.innerHTML = ''; $('#page-toolbar').innerHTML = '';
     if (App.globalMap) { try { App.globalMap.remove(); } catch (e) {} App.globalMap = null; } // PRODUCTION HARDENING: cegah memory leak Leaflet saat pindah halaman
-    const mapWrap = el('div', { id: 'global-map-el', style: 'height:calc(100vh - var(--topbar-height) - 90px);' });
-    container.appendChild(el('div', { class: 'card', style: 'padding:0;overflow:hidden;' }, [mapWrap]));
-    setTimeout(async () => {
-      const map = L.map(mapWrap, { zoomControl: true }).setView(CFG.DEFAULT_CENTER, CFG.DEFAULT_ZOOM);
-      App.globalMap = map;
-      L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { attribution: 'Tiles &copy; Esri', maxZoom: 20 }).addTo(map);
+    const state = { crossProject: false };
+    const scopeLabel = el('span', { class: 'text-xs text-muted' }, [App.currentProjectId ? ('Project: ' + (App.currentProjectName || '—')) : 'Belum pilih Project Aktif (tampil lintas-project)']);
+    const toolbar = el('div', { style: 'display:flex;align-items:center;gap:10px;padding:10px 12px;flex-wrap:wrap;' }, [
+      el('label', { style: 'display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;' }, [
+        el('input', { type: 'checkbox', onchange: (e) => { state.crossProject = e.target.checked; loadAndRenderGlobalMap(); } }),
+        'Tampilkan lintas SEMUA Project',
+      ]),
+      scopeLabel,
+    ]);
+    const mapWrap = el('div', { id: 'global-map-el', style: 'height:calc(100vh - var(--topbar-height) - 140px);' });
+    container.appendChild(el('div', { class: 'card', style: 'padding:0;overflow:hidden;' }, [toolbar, mapWrap]));
 
+    async function loadAndRenderGlobalMap() {
+      if (!App.globalMap) {
+        const map = L.map(mapWrap, { zoomControl: true }).setView(CFG.DEFAULT_CENTER, CFG.DEFAULT_ZOOM);
+        App.globalMap = map;
+        L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { attribution: 'Tiles &copy; Esri', maxZoom: 20 }).addTo(map);
+      }
+      const map = App.globalMap;
+      if (App._globalMapLayerControl) { map.removeControl(App._globalMapLayerControl); App._globalMapLayerControl = null; }
+      Object.values(App._globalMapLayerGroups || {}).forEach((lg) => map.removeLayer(lg));
+
+      // Scoping sementara: kalau toggle "lintas project" dicentang, matikan Project Aktif
+      // HANYA untuk pengambilan data view ini, lalu kembalikan seperti semula.
+      const savedProjectId = App.currentProjectId;
+      if (state.crossProject) App.currentProjectId = null;
       const [points, buildings] = await Promise.all([
         loadAllPointAssets(),
-        (async () => { try { const { data } = await App.supabase.from('detected_buildings').select('lat,lng,category,status').limit(ASSET_FETCH_LIMIT); return data || []; } catch (e) { return []; } })(),
+        (async () => {
+          try {
+            let q = App.supabase.from('detected_buildings').select('lat,lng,category,status,project_id').limit(ASSET_FETCH_LIMIT);
+            q = scopeToProject(q, 'detected_buildings');
+            const { data } = await q; return data || [];
+          } catch (e) { return []; }
+        })(),
       ]);
+      App.currentProjectId = savedProjectId;
 
       const layerGroups = {};
       const colorOf = { pole: '#8E6E53', odp: '#1F7A54', odc: '#0B6E99', home: '#B3261E', closure: '#9A6700', handhole: '#5B6774', jointbox: '#6B4EA0' };
       ASSET_DEFS.forEach((def) => {
         const pts = points.filter((p) => p.asset_type === def.type && p.lat != null);
-        // PRODUCTION HARDENING: pakai marker clustering (bukan layerGroup polos)
-        // supaya tetap responsif walau jumlah aset besar (ribuan-puluhan ribu titik).
         const lg = window.L.markerClusterGroup ? L.markerClusterGroup({ disableClusteringAtZoom: 18 }) : L.layerGroup();
         pts.forEach((p) => lg.addLayer(L.circleMarker([p.lat, p.lng], { radius: 5, color: colorOf[def.type] || '#333', fillOpacity: 0.85 }).bindPopup('<b>' + def.label + '</b><br>' + (p.name || '-') + '<br>Status: ' + p.asset_status)));
         layerGroups[def.label] = lg;
@@ -4248,13 +4539,17 @@
       layerGroups['Home Passed / Detected Building'] = buildingCluster;
 
       Object.values(layerGroups).forEach((lg) => lg.addTo(map));
-      L.control.layers({}, layerGroups, { collapsed: false, position: 'topright' }).addTo(map);
+      App._globalMapLayerGroups = layerGroups;
+      App._globalMapLayerControl = L.control.layers({}, layerGroups, { collapsed: false, position: 'topright' }).addTo(map);
 
       const allPts = points.filter((p) => p.lat != null).map((p) => [p.lat, p.lng]).concat(buildings.filter((b) => b.lat != null).map((b) => [b.lat, b.lng]));
       if (allPts.length) { try { map.fitBounds(allPts, { maxZoom: 16 }); } catch (e) {} }
-      toast('Global Map: ' + points.length + ' aset & ' + buildings.length + ' bangunan dimuat lintas seluruh project.', 'info');
+      const scopeText = state.crossProject ? 'lintas seluruh project' : (App.currentProjectId ? ('project "' + App.currentProjectName + '"') : 'lintas-project (belum pilih Project Aktif)');
+      toast('Global Map: ' + points.length + ' aset & ' + buildings.length + ' bangunan dimuat — ' + scopeText + '.', 'info');
       if (points._truncated) toast('Data aset dibatasi ' + ASSET_FETCH_LIMIT + ' baris/tabel untuk menjaga performa — sebagian data mungkin belum tampil.', 'warning', 6000);
-    }, 50);
+    }
+
+    setTimeout(loadAndRenderGlobalMap, 50);
   }, function destroyGlobalMap() {
     if (App.globalMap) { try { App.globalMap.remove(); } catch (e) {} App.globalMap = null; }
   });
@@ -4270,6 +4565,11 @@
     const PF = window.PlanningFinal;
     const reports = PF.buildAllAssetReports({ assets: all, changeLog, photos });
     const fname = 'asset_reports_' + new Date().toISOString().slice(0, 10);
+
+    container.appendChild(el('div', { class: 'card' }, [
+      el('div', { class: 'card-header' }, [el('h3', {}, ['Asset & QC Reports'])]),
+      el('p', { class: 'text-xs text-muted' }, [App.currentProjectId ? ('Menampilkan data project: ' + (App.currentProjectName || '—') + '.') : 'Belum pilih Project Aktif — menampilkan data lintas seluruh project.']),
+    ]));
 
     container.appendChild(el('div', { class: 'card' }, [
       el('div', { class: 'card-header' }, [el('h3', {}, ['Export'])]),
@@ -4331,6 +4631,7 @@
       $('#user-avatar').textContent = (App.profile.full_name || 'U').trim().charAt(0).toUpperCase();
     }
     $('#sidebar-version').textContent = 'v' + CFG.VERSION;
+    renderProjectSwitcher(); // FIX #E5: isi switcher "Project Aktif" di topbar
 
     const startRoute = location.hash ? location.hash.replace('#/', '') : (localStorage.getItem('ma_last_route') || 'dashboard');
     if (!location.hash) location.hash = '#/' + startRoute;

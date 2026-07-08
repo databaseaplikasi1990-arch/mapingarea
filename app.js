@@ -695,6 +695,7 @@
     const onCreated = (e) => {
       App.map.off(L.Draw.Event.CREATED, onCreated);
       const layer = e.layer; layer.addTo(App.map);
+      App.mapLayers['Gambar Polygon_' + Date.now()] = layer; // FIX #E33
       onComplete(layer.toGeoJSON().geometry, layer);
     };
     App.map.on(L.Draw.Event.CREATED, onCreated);
@@ -715,6 +716,12 @@
         App.map.off(L.Draw.Event.CREATED, onCreated);
         const layer = e.layer;
         layer.addTo(App.map);
+        // FIX #E33: sebelumnya layer hasil gambar HANYA ditambahkan ke App.map,
+        // tidak pernah didaftarkan ke App.mapLayers — jadi getBoundaryFromMap()
+        // (dipakai tombol "Analisa Area") tidak pernah menganggapnya ada, meski
+        // polygon-nya kelihatan tergambar di peta. Sekarang didaftarkan juga.
+        App.mapLayers[(shapeType === 'polygon' ? 'Gambar Polygon' : 'Gambar Garis') + '_' + Date.now()] = layer;
+        refreshLayerList();
         const geojson = layer.toGeoJSON();
         restoreModals();
         onComplete(geojson.geometry, layer);
@@ -818,6 +825,61 @@
     }
   }
 
+  // FIX #E32: sebelumnya hasil import KMZ/KML cuma jadi overlay visual di peta
+  // (folder "Data Import") — cuma polygon boundary yang benar-benar "terbaca"
+  // masuk ke alur app (dipakai Analisa Area). Titik/garis lain di file (mis.
+  // ODP/ODC/Tiang/Rumah hasil survey GPS) cuma nampang, tidak bisa jadi data
+  // asli. Sekarang setiap item (titik/garis/polygon) bisa langsung "Dijadikan
+  // Aset" dari popup-nya di peta — masuk ke tabel asli & folder Aset FTTH.
+  const POINT_ASSET_CHOICES = Object.entries(CFG.ASSET_DEFS).filter(([, d]) => d.geometryType === 'point');
+  const LINE_ASSET_CHOICES = Object.entries(CFG.ASSET_DEFS).filter(([, d]) => d.geometryType === 'line');
+  const POLY_ASSET_CHOICES = Object.entries(CFG.ASSET_DEFS).filter(([, d]) => d.geometryType === 'polygon');
+  let _convertSeq = 0;
+  function openConvertToAssetDialog(feature, geomType) {
+    const choices = geomType === 'point' ? POINT_ASSET_CHOICES : geomType === 'line' ? LINE_ASSET_CHOICES : POLY_ASSET_CHOICES;
+    if (!choices.length) { toast('Tidak ada tipe aset yang cocok untuk geometri ini.', 'warning'); return; }
+    const props = feature.properties || {};
+    const guessName = props.name || props.Name || props.NAME || props.title || '';
+    const typeSelect = el('select', { class: 'text-input' }, choices.map(([key, d]) => el('option', { value: key }, [d.title])));
+    const nameInput = el('input', { class: 'text-input', value: guessName });
+    const wrap = el('div');
+    let overlayRef;
+    wrap.appendChild(el('div', { class: 'modal-header' }, [
+      el('h3', {}, ['Jadikan Aset']),
+      el('button', { class: 'icon-btn', onclick: () => closeModal(overlayRef) }, [el('i', { class: 'fa-solid fa-xmark' })]),
+    ]));
+    wrap.appendChild(el('div', { class: 'modal-body' }, [
+      el('p', { class: 'text-xs text-muted' }, ['Item dari file import ini akan disimpan sebagai data asli (masuk ke folder Aset FTTH), bukan cuma tampilan peta.']),
+      el('div', { class: 'form-field full' }, [el('label', {}, ['Jadikan Tipe']), typeSelect]),
+      el('div', { class: 'form-field full' }, [el('label', {}, ['Nama']), nameInput]),
+      App.currentProjectId ? null : el('p', { class: 'text-xs', style: 'color:#B3261E;' }, ['Belum ada Project Aktif — item akan tersimpan tanpa tertaut ke project manapun.']),
+    ].filter(Boolean)));
+    wrap.appendChild(el('div', { class: 'modal-footer' }, [
+      el('button', { class: 'btn btn-ghost', onclick: () => closeModal(overlayRef) }, ['Batal']),
+      el('button', { class: 'btn btn-primary', onclick: async () => {
+        const key = typeSelect.value; const def = CFG.ASSET_DEFS[key];
+        const payload = { project_id: App.currentProjectId || null };
+        const nameField = def.fields.find((f) => ['name', 'owner_name', 'code'].includes(f.key));
+        payload[nameField ? nameField.key : 'name'] = nameInput.value.trim() || ('Import ' + (++_convertSeq));
+        if (def.geometryType === 'point') {
+          const c = feature.geometry.coordinates; payload.lng = c[0]; payload.lat = c[1];
+        } else {
+          const wkt = geometryToWKT(feature.geometry);
+          if (!wkt) { toast('Geometri tidak didukung untuk tipe ini.', 'error'); return; }
+          payload[def.geometryWriteColumn] = wkt;
+        }
+        try {
+          const { error } = await App.supabase.from(def.table).insert(payload);
+          if (error) throw error;
+          toast('Berhasil dijadikan ' + def.title + '.', 'success');
+          closeModal(overlayRef);
+          if (App.currentRoute === 'mapping') { App.assetLayerGroups[key] = null; refreshLayerList(); }
+        } catch (err) { toast('Gagal menyimpan: ' + err.message, 'error'); }
+      } }, ['Simpan']),
+    ]));
+    overlayRef = openModal(wrap, { size: 'sm' });
+  }
+
   function addGeoJsonLayer(name, geojson) {
     if (!App.map) return;
     const color = randomLayerColor();
@@ -825,10 +887,21 @@
       style: { color, weight: 2, fillOpacity: 0.15 },
       pointToLayer: (feature, latlng) => L.circleMarker(latlng, { radius: 6, color, fillColor: color, fillOpacity: 0.8 }),
       onEachFeature: (feature, lyr) => {
-        if (feature.properties) {
-          const rows = Object.entries(feature.properties).slice(0, 12)
-            .map(([k, v]) => `<tr><td style="padding:2px 8px 2px 0;color:var(--color-text-secondary)">${k}</td><td>${v}</td></tr>`).join('');
-          lyr.bindPopup(`<table>${rows}</table>`);
+        const gtype = feature.geometry && feature.geometry.type;
+        const isPoint = gtype === 'Point';
+        const isLine = gtype === 'LineString';
+        const isPoly = gtype === 'Polygon' || gtype === 'MultiPolygon';
+        const convId = 'conv-' + (++_convertSeq);
+        const rows = feature.properties ? Object.entries(feature.properties).slice(0, 12)
+          .map(([k, v]) => `<tr><td style="padding:2px 8px 2px 0;color:var(--color-text-secondary)">${k}</td><td>${v}</td></tr>`).join('') : '';
+        const convertBtn = (isPoint || isLine || isPoly)
+          ? `<div style="margin-top:6px;"><button id="${convId}" style="font-size:11px;padding:3px 10px;border:1px solid #1F3A5F;color:#1F3A5F;background:#fff;border-radius:6px;">Jadikan Aset</button></div>` : '';
+        lyr.bindPopup(`<table>${rows}</table>${convertBtn}`);
+        if (isPoint || isLine || isPoly) {
+          lyr.on('popupopen', () => {
+            const btn = document.getElementById(convId);
+            if (btn) btn.onclick = () => openConvertToAssetDialog(feature, isPoint ? 'point' : isLine ? 'line' : 'polygon');
+          });
         }
       },
     });
@@ -839,6 +912,7 @@
     try { App.map.fitBounds(layer.getBounds(), { maxZoom: 17 }); } catch (e) {}
     refreshLayerList();
   }
+
 
   function randomLayerColor() {
     const palette = ['#1F3A5F', '#0B6E99', '#1E7B4D', '#9A6700', '#B3261E', '#6B4FA0'];

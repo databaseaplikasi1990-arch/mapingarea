@@ -119,6 +119,18 @@
       if (overlay) overlay.classList.add('hidden');
     }
   }
+  // FIX #E34 (kritis): sebelumnya beberapa fungsi (mis. performBoundaryAnalysis)
+  // memanggil showGlobalLoading() BERKALI-KALI untuk update pesan progress dalam
+  // satu proses yang sama, padahal showGlobalLoading() menambah counter setiap
+  // dipanggil (dirancang untuk proses BERSARANG, bukan update pesan). Akibatnya
+  // counter tidak pernah balik ke 0 walau proses sudah selesai — overlay loading
+  // NYANGKUT SELAMANYA setelah Analisa Area dijalankan sekali. Dipisah: ganti
+  // pesan saja (tanpa nambah counter) pakai ini.
+  function updateGlobalLoadingMessage(message) {
+    const msgEl = document.getElementById('global-loading-message');
+    if (msgEl) msgEl.textContent = message || 'Memproses...';
+  }
+  App.updateGlobalLoadingMessage = updateGlobalLoadingMessage;
   App.showGlobalLoading = showGlobalLoading;
   App.hideGlobalLoading = hideGlobalLoading;
 
@@ -338,6 +350,10 @@
     content.innerHTML = '<div class="skeleton" style="height:120px;border-radius:10px;"></div>';
     localStorage.setItem('ma_last_route', route);
     activeModule = MODULES[route];
+    // FIX #E34 (jaring pengaman): reset paksa counter loading tiap pindah halaman,
+    // supaya kalaupun ada proses lain yang lupa nge-hide (bug baru di masa depan),
+    // overlay tidak akan nyangkut selama-lamanya — pindah halaman = state bersih.
+    _loadingDepth = 0;
     showGlobalLoading('Memuat halaman...');
     try {
       await activeModule.render(content);
@@ -2778,13 +2794,13 @@
       try { result = await engine.analyze(boundary, {}); }
       catch (err) { console.error(err); toast('Analisa gagal: ' + err.message, 'error'); return null; }
       App._lastAnalysis = { projectId: projectId || null, result };
-      showGlobalLoading('Menyimpan hasil analisa...');
+      updateGlobalLoadingMessage('Menyimpan hasil analisa...'); // FIX #E34: dulu showGlobalLoading() lagi (bug counter)
       const analysisId = await saveAnalysisToDb(projectId, result);
       if (analysisId) { App._lastAnalysis.id = analysisId; toast('Analisa selesai & tersimpan.', 'success'); }
       else { toast('Analisa selesai (belum tersimpan — jalankan migration 005).', 'warning', 5000); }
       // Revision 01: buat record per-bangunan ke detected_buildings (bukan tabel homes).
       if (analysisId) {
-        showGlobalLoading('Menyimpan data bangunan terdeteksi...');
+        updateGlobalLoadingMessage('Menyimpan data bangunan terdeteksi...'); // FIX #E34
         try { const n = await saveDetectedBuildings(analysisId, projectId, result.buildings.featureCollection); if (n) toast(fmtNumber(n) + ' bangunan tersimpan ke Detected Buildings.', 'info', 4000); } catch (e) { console.warn('[DetectedBuildings]', e && e.message); }
       }
       return { result, analysisId };

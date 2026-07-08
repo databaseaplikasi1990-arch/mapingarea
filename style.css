@@ -148,13 +148,13 @@ h1, h2, h3, h4 { margin: 0; font-weight: 600; color: var(--color-text); }
 /* ---------------------------------------------------------------- */
 /* 5. APP SHELL / LAYOUT                                             */
 /* ---------------------------------------------------------------- */
-.app-shell { display: flex; height: 100vh; overflow: hidden; }
+.app-shell { display: flex; height: 100vh; height: 100dvh; overflow: hidden; }
 
 .sidebar {
   width: var(--sidebar-width); flex-shrink: 0; background: var(--color-sidebar-bg);
   color: var(--color-sidebar-text); display: flex; flex-direction: column;
   transition: width 0.2s ease; overflow: hidden; z-index: 200;
-  height: 100vh; /* FIX #E16: jaga-jaga di WebView yang tidak stretch flex-item dgn benar */
+  height: 100vh; height: 100dvh; /* FIX #E16/#E35: jaga-jaga di WebView yang tidak stretch flex-item dgn benar, & quirk address-bar mobile */
 }
 .app-shell.sidebar-collapsed .sidebar { width: var(--sidebar-width-collapsed); }
 .sidebar-brand {
@@ -181,7 +181,7 @@ h1, h2, h3, h4 { margin: 0; font-weight: 600; color: var(--color-text); }
 .nav-item.active { background: var(--color-sidebar-active); color: var(--color-sidebar-text-active); }
 .sidebar-footer { padding: 12px 18px; font-size: 11px; color: #6E7E93; flex-shrink: 0; }
 
-.sidebar-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.45); z-index: 190; }
+.sidebar-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,0.45); z-index: 8999; }
 /* FIX #E16: di atas breakpoint mobile (lihat @media max-width:1024px di bawah), sidebar SELALU
    tampil permanen (bukan overlay) — jadi backdrop di sana cuma bikin peta gelap tanpa guna
    ("map menghalangi menu"). Backdrop hanya relevan saat sidebar jadi overlay (mobile). */
@@ -403,7 +403,7 @@ table.data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
   .stat-grid { grid-template-columns: repeat(2, 1fr); }
   .dash-grid { grid-template-columns: 1fr; }
   .form-grid { grid-template-columns: 1fr; }
-  .sidebar { position: fixed; top: 0; bottom: 0; left: 0; height: 100vh; z-index: 250; transform: translateX(-100%); }
+  .sidebar { position: fixed; top: 0; bottom: 0; left: 0; height: 100vh; height: 100dvh; z-index: 9000; transform: translateX(-100%); }
   .app-shell.sidebar-open .sidebar { transform: translateX(0); }
   .app-shell.sidebar-collapsed .sidebar { width: var(--sidebar-width); }
   .map-side-panel { width: 240px; }

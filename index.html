@@ -183,6 +183,16 @@
 <!-- ======================================================= -->
 <div id="modal-root" class="modal-root"></div>
 
+<!-- FIX #E22: overlay loading global — dipakai untuk SEMUA proses yang agak lama
+     (pindah halaman, Analisa Area, Generate, Deploy ke Implementasi, Import file, dst.)
+     supaya user tau prosesnya masih jalan dan tidak asal klik berkali-kali. -->
+<div id="global-loading-overlay" class="global-loading-overlay hidden">
+  <div class="global-loading-box">
+    <div class="global-loading-spinner"></div>
+    <div id="global-loading-message" class="global-loading-message">Memuat...</div>
+  </div>
+</div>
+
 <div id="confirm-dialog" class="modal-overlay hidden">
   <div class="modal-box modal-sm">
     <div class="modal-header">

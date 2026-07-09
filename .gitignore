@@ -12,3 +12,10 @@ backup_*.json
 
 # Local env notes (jika Anda menyimpan catatan kredensial lokal terpisah)
 *.local
+
+# wrangler files
+.wrangler
+.dev.vars*
+!.dev.vars.example
+.env*
+!.env.example

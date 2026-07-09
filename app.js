@@ -30,6 +30,9 @@
     heatMap: null,
     mapLayers: {},           // key -> L.LayerGroup (layer HASIL IMPORT, folder "Data Import")
     assetLayerGroups: {},    // assetKey -> L.LayerGroup (folder "Aset FTTH", lazy-loaded per tipe aset)
+    detectedBuildingsLayers: {}, // FIX #E37: kategori -> L.LayerGroup (folder "Bangunan Terdeteksi" per kategori)
+    draftLayers: {}, // FIX #E38: odp/odc/poles/backbone/distribution -> L.LayerGroup (folder "Draft Perencanaan")
+    draftLineEditors: {}, // FIX #E39: backbone/distribution -> { editing, editHandler } (edit vertex jalur draft)
     autosaveTimer: null,
     realtimeChannels: [],
     // FIX #E5 (per-project scoping): project yang sedang aktif dipilih user.
@@ -553,6 +556,13 @@
       el('button', { class: 'btn btn-primary btn-sm', onclick: () => App.runAreaAnalysis && App.runAreaAnalysis(null) }, [
         el('i', { class: 'fa-solid fa-wand-magic-sparkles' }), ' Analisa Area',
       ]),
+      // FIX #E38: sebelumnya Generate (Auto ODP/ODC/Backbone/Distribution) cuma
+      // bisa dijalankan lewat Smart Planning Wizard, terpisah dari peta ini.
+      // Sekarang bisa langsung dari Mapping — hasilnya jadi layer draft yang
+      // bisa langsung diedit/digeser/dihapus di peta yang sama.
+      el('button', { class: 'btn btn-primary btn-sm', onclick: () => runGenerateFromMap() }, [
+        el('i', { class: 'fa-solid fa-diagram-project' }), ' Generate Planning',
+      ]),
       el('button', { class: 'btn btn-secondary btn-sm', onclick: () => toggleMeasureTool() }, [
         el('i', { class: 'fa-solid fa-ruler' }), ' Ukur Jarak/Area',
       ]),
@@ -574,7 +584,9 @@
     if (App.map) { App.map.remove(); App.map = null; }
     App.mapLayers = {};
     App.assetLayerGroups = {}; // FIX #E6: layer aset terikat ke instance peta lama, harus dibuat ulang saat halaman Mapping dibuka lagi
-    App.detectedBuildingsLayer = null; // FIX #E20: sama halnya untuk layer Bangunan Terdeteksi
+    App.detectedBuildingsLayers = {}; // FIX #E20/#E37: sama halnya untuk layer Bangunan Terdeteksi (per kategori)
+    App.draftLayers = {}; // FIX #E38: sama halnya untuk layer Draft Perencanaan
+    App.draftLineEditors = {}; // FIX #E39: reset state edit jalur draft juga
   });
 
   function initMap(mapWrap) {
@@ -1167,43 +1179,296 @@
       ftthBody,
     ]));
 
-    // ---- FOLDER 3: Bangunan Terdeteksi (hasil Analisa Area) — FIX #E20 ----
+    // ---- FOLDER 3: Bangunan Terdeteksi (hasil Analisa Area) — FIX #E20/#E37 ----
     // Supaya hasil Analisa Area tidak "menghilang" ke halaman lain: bangunan hasil
     // deteksi bisa langsung dicentang untuk tampil di peta INI, digeser/edit
-    // posisinya (drag), dan dihapus — persis seperti folder Aset FTTH lainnya.
+    // posisinya (drag), ditambah manual, dan dihapus — dipecah per KATEGORI
+    // (Rumah/Ruko/Gedung/Apartemen/Lainnya) supaya kelihatan rinciannya, bukan
+    // cuma 1 angka total.
     const dbExpanded = !!layerTreeState.sub['detected_buildings'];
-    const dbChecked = !!(App.detectedBuildingsLayer && App.map && App.map.hasLayer(App.detectedBuildingsLayer));
-    let dbCount = 0;
+    const dbCounts = {};
+    let dbTotal = 0;
     try {
-      let q = App.supabase.from('detected_buildings').select('*', { count: 'exact', head: true });
+      let q = App.supabase.from('detected_buildings').select('category');
       q = scopeToProject(q, 'detected_buildings');
-      const { count } = await q; dbCount = count || 0;
+      const { data } = await q;
+      (data || []).forEach((r) => { const c = r.category || 'Lainnya'; dbCounts[c] = (dbCounts[c] || 0) + 1; dbTotal++; });
     } catch (e) {}
+    const dbBody = el('div', { class: 'layer-folder-body' + (dbExpanded ? '' : ' hidden') }, [
+      el('p', { class: 'text-xs text-muted layer-folder-desc' }, ['Hasil Auto Detect Building dari Analisa Area, dipecah per kategori. Centang untuk tampil di peta. Klik marker untuk info/Hapus, tahan+geser untuk pindah posisi, atau klik "+ Tambah" untuk tambah manual.']),
+    ]);
+    BUILDING_CATEGORIES.forEach((cat) => {
+      const catExpanded = !!layerTreeState.sub['db:' + cat];
+      const catChecked = !!(App.detectedBuildingsLayers[cat] && App.map && App.map.hasLayer(App.detectedBuildingsLayers[cat]));
+      dbBody.appendChild(el('div', { class: 'layer-folder layer-subfolder' }, [
+        el('div', { class: 'layer-folder-header' }, [
+          el('i', { class: 'fa-solid ' + (catExpanded ? 'fa-chevron-down' : 'fa-chevron-right'), style: 'width:12px;font-size:10px;cursor:pointer;', onclick: () => toggleFolder('db:' + cat) }),
+          el('input', { type: 'checkbox', checked: catChecked ? 'checked' : null, title: 'Tampilkan ' + cat + ' di peta', onchange: async (e) => {
+            const lg = await loadDetectedBuildingsLayerByCategory(cat);
+            if (e.target.checked) App.map.addLayer(lg); else App.map.removeLayer(lg);
+          } }),
+          el('i', { class: 'fa-solid ' + (BUILDING_CATEGORY_ICON[cat] || 'fa-building') }),
+          el('span', { style: 'flex:1;' }, [cat]),
+          el('span', { class: 'text-xs text-muted' }, ['(' + fmtNumber(dbCounts[cat] || 0) + ')']),
+          el('button', { class: 'icon-btn btn-icon-only', title: 'Tambah ' + cat + ' manual (klik lokasi di peta)', style: 'width:22px;height:22px;', onclick: () => startAddDetectedBuilding(cat) }, [el('i', { class: 'fa-solid fa-plus', style: 'font-size:10px' })]),
+        ]),
+        el('div', { class: 'layer-folder-body' + (catExpanded ? '' : ' hidden') }, [
+          el('p', { class: 'text-xs text-muted', style: 'padding:4px 8px;' }, [fmtNumber(dbCounts[cat] || 0) + ' ' + cat.toLowerCase() + ' terdeteksi — centang di atas untuk tampilkan titiknya di peta (lengkap koordinat & ID per titik lewat klik marker).']),
+        ]),
+      ]));
+    });
     tree.appendChild(el('div', { class: 'layer-folder' }, [
       el('div', { class: 'layer-folder-header' }, [
         el('i', { class: 'fa-solid ' + (dbExpanded ? 'fa-chevron-down' : 'fa-chevron-right'), style: 'width:12px;font-size:10px;cursor:pointer;', onclick: () => toggleFolder('detected_buildings') }),
-        el('input', { type: 'checkbox', checked: dbChecked ? 'checked' : null, title: 'Tampilkan hasil Analisa Area di peta ini', onchange: async (e) => {
-          const lg = await loadDetectedBuildingsLayer();
-          if (e.target.checked) App.map.addLayer(lg); else App.map.removeLayer(lg);
-        } }),
         el('i', { class: 'fa-solid fa-city', style: 'color:#2563EB;' }),
         el('span', { style: 'font-weight:600;flex:1;' }, ['Bangunan Terdeteksi']),
-        el('span', { class: 'text-xs text-muted' }, ['(' + fmtNumber(dbCount) + ' bangunan)']),
+        el('span', { class: 'text-xs text-muted' }, ['(' + fmtNumber(dbTotal) + ' bangunan)']),
         el('button', { class: 'icon-btn btn-icon-only', title: 'Buka daftar lengkap', style: 'width:22px;height:22px;', onclick: () => { location.hash = '#/detected-buildings'; } }, [el('i', { class: 'fa-solid fa-table-list', style: 'font-size:10px' })]),
       ]),
-      el('p', { class: 'text-xs text-muted layer-folder-desc' + (dbExpanded ? '' : ' hidden') }, ['Hasil Auto Detect Building dari Analisa Area — centang untuk tampil di peta. Klik marker untuk lihat info & Hapus, tahan+geser untuk pindah posisi. Semua perubahan tersimpan otomatis.']),
+      dbBody,
     ]));
+
+    // ---- FOLDER 4: Draft Perencanaan (hasil Generate Planning) — FIX #E38/#E39 ----
+    // Supaya "Generate Planning" juga tidak perlu keluar dari peta: draft ODP/ODC/
+    // Tiang bisa langsung dicentang untuk tampil, digeser/dihapus/ditambah di
+    // peta ini. Backbone/Distribution JUGA bisa diedit — klik ikon ✏️ untuk
+    // mengaktifkan mode geser titik jalur (Leaflet.draw Edit), klik ikon 💾
+    // untuk menyimpan bentuk baru + panjang jalur terbaru.
+    const draftGen = App._lastGeneration;
+    if (draftGen && draftGen.gen) {
+      const draftExpanded = !!layerTreeState.sub['draft'];
+      const draftBody = el('div', { class: 'layer-folder-body' + (draftExpanded ? '' : ' hidden') }, [
+        el('p', { class: 'text-xs text-muted layer-folder-desc' }, ['Hasil "Generate Planning" (auto ODP 1:8, ODC 1:4, Backbone, Distribution, Tiang). ODP/ODC/Tiang bisa digeser & dihapus langsung. Setelah yakin, klik "Simpan & Lihat Detail Analisa" pada banner, lalu lanjutkan ke Approval → Deploy ke Implementasi.']),
+      ]);
+      const CORE_OPTIONS = { backbone: [96, 48, 24], distribution: [24, 16, 6] };
+      const draftCoreCounts = {};
+      for (const k of ['backbone', 'distribution']) {
+        try {
+          const table = k === 'backbone' ? 'planning_backbone' : 'planning_distribution';
+          let q = App.supabase.from(table).select('core_count').limit(1);
+          if (draftGen.savedId) q = q.eq('generation_id', draftGen.savedId);
+          const { data } = await q;
+          draftCoreCounts[k] = data && data[0] ? data[0].core_count : null;
+        } catch (e) { draftCoreCounts[k] = null; }
+      }
+      const DRAFT_TYPES = [
+        { key: 'odp', label: 'ODP (Draft)', icon: 'fa-diagram-project', count: (draftGen.gen.odps || []).length },
+        { key: 'odc', label: 'ODC (Draft)', icon: 'fa-server', count: (draftGen.gen.odcs || []).length },
+        { key: 'poles', label: 'Tiang (Draft)', icon: 'fa-tower-cell', count: (draftGen.gen.poles && draftGen.gen.poles.points ? draftGen.gen.poles.points.length : 0) },
+        { key: 'backbone', label: 'Backbone (Draft)', icon: 'fa-route', count: (draftGen.gen.backbone && draftGen.gen.backbone.segment_count) || 0 },
+        { key: 'distribution', label: 'Distribution (Draft)', icon: 'fa-share-nodes', count: (draftGen.gen.distribution && draftGen.gen.distribution.segment_count) || 0 },
+      ];
+      DRAFT_TYPES.forEach((dt) => {
+        const dtExpanded = !!layerTreeState.sub['draft:' + dt.key];
+        const dtChecked = !!(App.draftLayers[dt.key] && App.map && App.map.hasLayer(App.draftLayers[dt.key]));
+        const isLine = dt.key === 'backbone' || dt.key === 'distribution';
+        const isEditingLine = !!(App.draftLineEditors[dt.key] && App.draftLineEditors[dt.key].editing);
+        // FIX #E41: pilihan jumlah core untuk Backbone/Distribution draft.
+        const coreSelect = isLine ? el('select', { class: 'text-input', style: 'font-size:11px;padding:2px 4px;max-width:110px;', title: 'Jumlah Core', onchange: async (e) => {
+          try {
+            const table = dt.key === 'backbone' ? 'planning_backbone' : 'planning_distribution';
+            const v = e.target.value ? Number(e.target.value) : null;
+            let q = App.supabase.from(table).update({ core_count: v });
+            if (draftGen.savedId) q = q.eq('generation_id', draftGen.savedId);
+            const { error } = await q; if (error) throw error;
+            toast('Jumlah core ' + dt.key + ' tersimpan: ' + (v || '-'), 'success');
+          } catch (err) { toast('Gagal simpan core (pastikan migration 016 sudah dijalankan): ' + err.message, 'error', 6000); }
+        } }, [el('option', { value: '' }, ['Core: - pilih -'])].concat(CORE_OPTIONS[dt.key].map((c) => el('option', { value: c, selected: String(draftCoreCounts[dt.key] || '') === String(c) ? 'selected' : null }, [c + ' core'])))) : null;
+        draftBody.appendChild(el('div', { class: 'layer-folder layer-subfolder' }, [
+          el('div', { class: 'layer-folder-header' }, [
+            el('i', { class: 'fa-solid ' + (dtExpanded ? 'fa-chevron-down' : 'fa-chevron-right'), style: 'width:12px;font-size:10px;cursor:pointer;', onclick: () => toggleFolder('draft:' + dt.key) }),
+            el('input', { type: 'checkbox', checked: dtChecked ? 'checked' : null, title: 'Tampilkan ' + dt.label + ' di peta', onchange: async (e) => {
+              const lg = await loadDraftLayer(dt.key, draftGen);
+              if (e.target.checked) App.map.addLayer(lg); else App.map.removeLayer(lg);
+            } }),
+            el('i', { class: 'fa-solid ' + dt.icon }),
+            el('span', { style: 'flex:1;' }, [dt.label]),
+            el('span', { class: 'text-xs text-muted' }, ['(' + fmtNumber(dt.count) + ')']),
+            isLine
+              ? el('button', { class: 'icon-btn btn-icon-only', title: isEditingLine ? 'Simpan perubahan jalur' : 'Edit jalur (geser titik)', style: 'width:22px;height:22px;color:' + (isEditingLine ? '#1F7A54' : ''), onclick: () => toggleDraftLineEdit(dt.key, draftGen) }, [el('i', { class: 'fa-solid ' + (isEditingLine ? 'fa-floppy-disk' : 'fa-pen-ruler'), style: 'font-size:10px' })])
+              : el('button', { class: 'icon-btn btn-icon-only', title: 'Tambah manual (klik lokasi di peta)', style: 'width:22px;height:22px;', onclick: () => startAddDraftPoint(dt.key, draftGen) }, [el('i', { class: 'fa-solid fa-plus', style: 'font-size:10px' })]),
+          ]),
+          el('div', { class: 'layer-folder-body' + (dtExpanded ? '' : ' hidden') }, [
+            el('p', { class: 'text-xs text-muted', style: 'padding:4px 8px;' }, [isLine ? 'Klik ikon ✏️ untuk mulai geser titik-titik jalur di peta, klik lagi (ikon 💾) untuk simpan perubahan.' : 'Klik marker untuk lihat info/Hapus, tahan+geser untuk pindah posisi. Untuk Tiang, pilih tinggi lewat popup marker-nya.']),
+            isLine ? el('div', { style: 'padding:4px 8px;' }, [coreSelect]) : null,
+          ].filter(Boolean)),
+        ]));
+      });
+      tree.appendChild(el('div', { class: 'layer-folder' }, [
+        el('div', { class: 'layer-folder-header' }, [
+          el('i', { class: 'fa-solid ' + (draftExpanded ? 'fa-chevron-down' : 'fa-chevron-right'), style: 'width:12px;font-size:10px;cursor:pointer;', onclick: () => toggleFolder('draft') }),
+          el('i', { class: 'fa-solid fa-diagram-project', style: 'color:#8B5CF6;' }),
+          el('span', { style: 'font-weight:600;flex:1;' }, ['Draft Perencanaan']),
+          el('button', { class: 'icon-btn btn-icon-only', title: 'Lihat Detail Analisa & BOQ', style: 'width:22px;height:22px;', onclick: () => { location.hash = '#/planning-summary' + (draftGen.analysisId ? ('?analysis=' + draftGen.analysisId) : ''); } }, [el('i', { class: 'fa-solid fa-table-list', style: 'font-size:10px' })]),
+        ]),
+        draftBody,
+      ]));
+    }
 
     listEl.appendChild(tree);
   }
 
-  // Layer "Bangunan Terdeteksi" — marker draggable + popup edit ringkas + hapus,
+  // FIX #E38: klik "+ Tambah" pada folder draft -> klik 1 titik di peta -> insert
+  // ke tabel draft terkait (planning_odp/odc/poles) dengan generation_id sama.
+  // FIX #E39: "Edit Jalur" — aktifkan handle titik (vertex) Leaflet.draw pada
+  // featureGroup Backbone/Distribution supaya bisa digeser bentuknya, lalu
+  // simpan hasilnya (geojson + panjang baru) ke tabel draft terkait.
+  async function toggleDraftLineEdit(key, draftGen) {
+    const lg = await loadDraftLayer(key, draftGen);
+    if (!App.map.hasLayer(lg)) { App.map.addLayer(lg); refreshLayerList(); }
+    const state = App.draftLineEditors[key] || (App.draftLineEditors[key] = { editing: false, handler: null });
+    if (!state.editing) {
+      state.handler = new L.EditToolbar.Edit(App.map, { featureGroup: lg });
+      state.handler.enable();
+      state.editing = true;
+      toast('Mode edit jalur aktif — geser titik-titik jalur, lalu klik ikon simpan (💾) kalau sudah selesai.', 'info', 5000);
+      refreshLayerList();
+    } else {
+      try { state.handler.save(); } catch (e) {}
+      try { state.handler.disable(); } catch (e) {}
+      state.editing = false;
+      // Ambil geometri terbaru dari featureGroup & simpan ke tabel draft.
+      try {
+        const fc = lg.toGeoJSON();
+        let totalLen = 0;
+        try { fc.features.forEach((f) => { totalLen += window.turf.length(f, { units: 'kilometers' }) * 1000; }); } catch (e) {}
+        const table = key === 'backbone' ? 'planning_backbone' : 'planning_distribution';
+        let q = App.supabase.from(table).update({ geojson: fc, length_m: Math.round(totalLen) });
+        if (draftGen.savedId) q = q.eq('generation_id', draftGen.savedId);
+        const { error } = await q;
+        if (error) throw error;
+        // Sinkronkan juga ke snapshot di memori supaya BOQ/Detail Analisa ikut update.
+        if (draftGen.gen && draftGen.gen[key]) { draftGen.gen[key].featureCollection = fc; draftGen.gen[key].length_m = Math.round(totalLen); }
+        toast('Perubahan jalur ' + key + ' tersimpan (' + fmtNumber(Math.round(totalLen)) + ' m).', 'success');
+      } catch (err) { toast('Gagal simpan jalur: ' + err.message, 'error'); }
+      refreshLayerList();
+    }
+  }
+
+  function startAddDraftPoint(key, draftGen) {
+    if (!App.map) return;
+    const table = key === 'odp' ? 'planning_odp' : key === 'odc' ? 'planning_odc' : 'planning_poles';
+    toast('Klik posisi di peta untuk tambah ' + key.toUpperCase() + ' draft baru.', 'info', 4000);
+    const handler = async (e) => {
+      App.map.off('click', handler);
+      const { lat, lng } = e.latlng;
+      try {
+        const idField = key === 'poles' ? 'pole_id' : (key + '_id');
+        const idVal = key.toUpperCase() + '-' + Date.now().toString(36).toUpperCase();
+        const payload = { analysis_id: draftGen.analysisId, generation_id: draftGen.savedId, lat, lng };
+        payload[idField] = idVal;
+        const { error } = await App.supabase.from(table).insert(payload);
+        if (error) throw error;
+        toast(key.toUpperCase() + ' draft baru ditambahkan.', 'success');
+        App.draftLayers[key] = null; refreshLayerList();
+      } catch (err) { toast('Gagal menambah: ' + err.message, 'error'); }
+    };
+    App.map.on('click', handler);
+  }
+
+  // Muat layer draft (ODP/ODC/Tiang bisa digeser/hapus; Backbone/Distribution
+  // bisa diedit vertex-nya via toggleDraftLineEdit — FIX #E39).
+  async function loadDraftLayer(key, draftGen) {
+    if (App.draftLayers[key]) return App.draftLayers[key];
+    const isLine = key === 'backbone' || key === 'distribution';
+    // FIX #E39: pakai L.featureGroup (bukan layerGroup biasa) khusus utk garis,
+    // supaya bisa dilacak & di-edit vertex-nya oleh Leaflet.draw Edit toolbar.
+    const lg = isLine ? L.featureGroup() : (window.L.markerClusterGroup ? L.markerClusterGroup() : L.layerGroup());
+    const color = '#8B5CF6';
+    try {
+      if (isLine) {
+        const genObj = draftGen.gen[key];
+        const fc = genObj && genObj.featureCollection;
+        if (fc) L.geoJSON(fc, { style: { color, weight: 3 } }).eachLayer((sub) => sub.addTo(lg));
+      } else {
+        const table = key === 'odp' ? 'planning_odp' : key === 'odc' ? 'planning_odc' : 'planning_poles';
+        const idField = key === 'poles' ? 'pole_id' : (key + '_id');
+        let q = App.supabase.from(table).select('*');
+        if (draftGen.savedId) q = q.eq('generation_id', draftGen.savedId);
+        const { data, error } = await q;
+        if (error) throw error;
+        (data || []).forEach((row) => {
+          if (row.lat == null || row.lng == null) return;
+          const marker = L.marker([row.lat, row.lng], {
+            draggable: true,
+            icon: L.divIcon({ className: '', html: '<div style="width:14px;height:14px;border-radius:50%;background:' + color + ';border:2px solid #fff;box-shadow:0 0 0 1px ' + color + ';"></div>', iconSize: [14, 14], iconAnchor: [7, 7] }),
+          });
+          const label = row[idField] || row.id;
+          // FIX #E41: khusus Tiang draft, tambahkan pilihan Tinggi (6/7/9 m) di popup.
+          const heightSelectHtml = key === 'poles'
+            ? '<div style="margin-top:6px;">Tinggi: <select id="draft-height-' + row.id + '" style="font-size:11px;padding:2px 4px;border-radius:4px;">' +
+              ['', 6, 7, 9].map((h) => '<option value="' + h + '"' + (String(row.height_m || '') === String(h) ? ' selected' : '') + '>' + (h === '' ? '- pilih -' : h + ' m') + '</option>').join('') +
+              '</select></div>'
+            : '';
+          marker.bindPopup('<b>' + label + '</b> (draft)<br>Lat: ' + Number(row.lat).toFixed(6) + ' · Lng: ' + Number(row.lng).toFixed(6) +
+            '<br><span style="font-size:11px;color:#666;">Tahan &amp; geser untuk pindah posisi.</span>' +
+            heightSelectHtml +
+            '<div style="margin-top:6px;"><button id="draft-del-' + row.id + '" style="font-size:11px;padding:2px 8px;border:1px solid #B3261E;color:#B3261E;background:#fff;border-radius:6px;">Hapus</button></div>');
+          marker.on('popupopen', () => {
+            const delBtn = document.getElementById('draft-del-' + row.id);
+            if (delBtn) delBtn.onclick = async () => {
+              if (!(await confirmDialog('Hapus ' + label + ' dari draft?', 'Hapus Draft'))) return;
+              try { await App.supabase.from(table).delete().eq('id', row.id); lg.removeLayer(marker); toast('Dihapus dari draft.', 'success'); }
+              catch (e) { toast('Gagal hapus: ' + e.message, 'error'); }
+            };
+            const heightSel = document.getElementById('draft-height-' + row.id);
+            if (heightSel) heightSel.onchange = async () => {
+              try {
+                const v = heightSel.value ? Number(heightSel.value) : null;
+                await App.supabase.from(table).update({ height_m: v }).eq('id', row.id);
+                row.height_m = v;
+                toast('Tinggi tiang tersimpan: ' + (v ? v + ' m' : '-'), 'success');
+              } catch (e) { toast('Gagal simpan tinggi (pastikan migration 016 sudah dijalankan): ' + e.message, 'error', 6000); }
+            };
+          });
+          marker.on('dragend', async () => {
+            const p = marker.getLatLng();
+            try { await App.supabase.from(table).update({ lat: p.lat, lng: p.lng }).eq('id', row.id); toast('Posisi draft tersimpan.', 'success'); }
+            catch (e) { toast('Gagal simpan posisi: ' + e.message, 'error'); }
+          });
+          marker.addTo(lg);
+        });
+      }
+    } catch (e) { /* migration draft belum jalan — folder tetap tampil kosong */ }
+    App.draftLayers[key] = lg;
+    return lg;
+  }
+
+  // FIX #E37: klik "+ Tambah" per kategori -> klik 1 titik di peta -> langsung
+  // tersimpan sebagai bangunan baru kategori tsb (building_id otomatis).
+  function startAddDetectedBuilding(category) {
+    if (!App.map) return;
+    toast('Klik posisi di peta untuk tambah bangunan "' + category + '" baru.', 'info', 4000);
+    const handler = async (e) => {
+      App.map.off('click', handler);
+      const { lat, lng } = e.latlng;
+      try {
+        const buildingId = 'MANUAL-' + Date.now().toString(36).toUpperCase();
+        const { error } = await App.supabase.from('detected_buildings').insert({
+          building_id: buildingId, category, lat, lng, centroid_lat: lat, centroid_lng: lng,
+          status: 'edited', project_id: App.currentProjectId || null,
+          planner: (App.profile && App.profile.full_name) || 'Pengguna',
+          created_by: (App.session && App.session.user) ? App.session.user.id : null,
+        });
+        if (error) throw error;
+        toast('Bangunan "' + category + '" berhasil ditambahkan.', 'success');
+        App.detectedBuildingsLayers[category] = null; // paksa reload
+        refreshLayerList();
+      } catch (err) { toast('Gagal menambah bangunan: ' + err.message, 'error'); }
+    };
+    App.map.on('click', handler);
+  }
+
+  const BUILDING_CATEGORIES = ['Rumah', 'Ruko', 'Gedung', 'Apartemen', 'Lainnya'];
+  const BUILDING_CATEGORY_ICON = { Rumah: 'fa-house', Ruko: 'fa-store', Gedung: 'fa-building', Apartemen: 'fa-city', Lainnya: 'fa-shapes' };
+
+  // Layer per kategori bangunan — marker draggable + popup edit ringkas + hapus,
   // langsung di peta (tanpa buka halaman Detected Buildings).
-  async function loadDetectedBuildingsLayer() {
-    if (App.detectedBuildingsLayer) return App.detectedBuildingsLayer;
+  async function loadDetectedBuildingsLayerByCategory(category) {
+    if (App.detectedBuildingsLayers[category]) return App.detectedBuildingsLayers[category];
     const lg = window.L.markerClusterGroup ? L.markerClusterGroup() : L.layerGroup();
     try {
-      let q = App.supabase.from('detected_buildings').select('*').limit(ASSET_FETCH_LIMIT || 5000);
+      let q = App.supabase.from('detected_buildings').select('*').eq('category', category).limit(ASSET_FETCH_LIMIT || 5000);
       q = scopeToProject(q, 'detected_buildings');
       const { data, error } = await q;
       if (error) throw error;
@@ -1235,7 +1500,7 @@
         marker.addTo(lg);
       });
     } catch (e) { /* migration 008 belum jalan — folder tetap tampil kosong */ }
-    App.detectedBuildingsLayer = lg;
+    App.detectedBuildingsLayers[category] = lg;
     return lg;
   }
 
@@ -1448,7 +1713,7 @@
       for (const f of def.fields) {
         const raw = inputRefs[f.key].value;
         if (f.required && !raw) { toast(f.label + ' wajib diisi.', 'warning'); return; }
-        payload[f.key] = f.type === 'number' ? (raw === '' ? null : Number(raw)) : (raw || null);
+        payload[f.key] = (f.type === 'number' || f.numeric) ? (raw === '' ? null : Number(raw)) : (raw || null);
       }
       if ((def.geometryType === 'polygon' || def.geometryType === 'line')) {
         if (geomState && geomState.value) {
@@ -2703,6 +2968,19 @@
      Tidak membuat Auto ODP/ODC/Backbone/Pole/BOQ/Proposal/AI (itu fase berikutnya). */
 
   // Ambil FeatureCollection polygon dari layer-layer peta yang sedang aktif.
+  // FIX #E36: banyak KML hasil export dari GPS/app survey menyimpan boundary
+  // sebagai garis TERTUTUP (closed LineString/Track), bukan <Polygon> KML yang
+  // "benar" — jadi walau kelihatan jelas jadi area tertutup di peta, geometrinya
+  // secara teknis LineString dan sebelumnya SELALU diabaikan oleh boundary
+  // check (cuma terima Polygon/MultiPolygon), sehingga "Belum ada polygon"
+  // terus muncul walau file sudah keimport & kelihatan di peta.
+  function ringFromCoords(coords) {
+    if (!coords || coords.length < 3) return null;
+    const first = coords[0], last = coords[coords.length - 1];
+    const closed = Math.abs(first[0] - last[0]) < 1e-6 && Math.abs(first[1] - last[1]) < 1e-6;
+    const ring = closed ? coords : coords.concat([first]);
+    return ring.length >= 4 ? ring : null;
+  }
   function getBoundaryFromMap() {
     if (!App.mapLayers) return null;
     const feats = [];
@@ -2713,7 +2991,18 @@
       const list = gj.type === 'FeatureCollection' ? gj.features : [gj];
       list.forEach((f) => {
         const g = f && (f.geometry || f);
-        if (g && (g.type === 'Polygon' || g.type === 'MultiPolygon')) feats.push(f.type === 'Feature' ? f : { type: 'Feature', properties: {}, geometry: g });
+        if (!g) return;
+        if (g.type === 'Polygon' || g.type === 'MultiPolygon') {
+          feats.push(f.type === 'Feature' ? f : { type: 'Feature', properties: {}, geometry: g });
+        } else if (g.type === 'LineString') {
+          const ring = ringFromCoords(g.coordinates);
+          if (ring) feats.push({ type: 'Feature', properties: (f && f.properties) || {}, geometry: { type: 'Polygon', coordinates: [ring] } });
+        } else if (g.type === 'MultiLineString') {
+          (g.coordinates || []).forEach((line) => {
+            const ring = ringFromCoords(line);
+            if (ring) feats.push({ type: 'Feature', properties: (f && f.properties) || {}, geometry: { type: 'Polygon', coordinates: [ring] } });
+          });
+        }
       });
     });
     return feats.length ? { type: 'FeatureCollection', features: feats } : null;
@@ -2784,7 +3073,7 @@
     if (!engine || typeof engine.analyze !== 'function') { toast('Planning Engine belum termuat (planning-analyzers.js).', 'error'); return null; }
     const boundary = getBoundaryFromMap();
     if (!boundary) {
-      toast('Belum ada polygon di peta. Import KMZ/KML atau gambar polygon dulu di halaman Map.', 'warning', 5000);
+      toast('Belum ada polygon/garis tertutup di peta. Import KMZ/KML atau gambar polygon dulu.', 'warning', 5000);
       return null;
     }
     if (!(await confirmReplaceDetectedBuildings(projectId))) return null; // FIX #E15
@@ -2865,10 +3154,11 @@
     // di tempat (folder "Bangunan Terdeteksi"), dan baru pindah ke ringkasan analisa
     // setelah planner eksplisit klik "Simpan & Lihat Detail Analisa".
     if (App.currentRoute === 'mapping' && App.map) {
-      if (App.detectedBuildingsLayer) { try { App.map.removeLayer(App.detectedBuildingsLayer); } catch (e) {} }
-      App.detectedBuildingsLayer = null; // paksa reload data terbaru
-      const lg = await loadDetectedBuildingsLayer();
-      lg.addTo(App.map);
+      // FIX #E37: paksa reload semua layer per-kategori bangunan (bukan cuma 1 layer gabungan)
+      Object.entries(App.detectedBuildingsLayers || {}).forEach(([cat, lg]) => {
+        if (lg) { try { App.map.removeLayer(lg); } catch (e) {} }
+        App.detectedBuildingsLayers[cat] = null;
+      });
       layerTreeState.sub['detected_buildings'] = true;
       refreshLayerList();
       showAnalysisResultBanner(out);
@@ -2896,6 +3186,48 @@
       ]),
       el('button', { class: 'btn btn-ghost btn-sm', onclick: () => banner.remove() }, ['Tutup']),
       el('button', { class: 'btn btn-primary btn-sm', onclick: () => { location.hash = out.analysisId ? ('#/planning-summary?analysis=' + out.analysisId) : '#/planning-summary'; } }, [el('i', { class: 'fa-solid fa-floppy-disk' }), ' Simpan & Lihat Detail Analisa']),
+    ]);
+    ($('#map-container') || document.body).appendChild(banner);
+  }
+
+  // FIX #E38: "Generate Planning" langsung dari Mapping — hasil draft (ODP/ODC/
+  // Tiang/Backbone/Distribution/BOQ) tampil sebagai layer "Draft Perencanaan" yang
+  // bisa langsung diedit/digeser/dihapus di peta yang sama, tanpa masuk Wizard.
+  async function runGenerateFromMap() {
+    const analysisId = (App._lastAnalysis && App._lastAnalysis.id) || null;
+    if (!analysisId) { toast('Jalankan "Analisa Area" dulu sebelum Generate Planning.', 'warning', 5000); return; }
+    const out = await runGenerate(analysisId);
+    if (!out) return;
+    if (App.currentRoute === 'mapping' && App.map) {
+      Object.keys(App.draftLayers || {}).forEach((k) => {
+        if (App.draftLayers[k]) { try { App.map.removeLayer(App.draftLayers[k]); } catch (e) {} }
+        App.draftLayers[k] = null;
+      });
+      layerTreeState.sub['draft'] = true;
+      refreshLayerList();
+      showGenerateResultBanner(out);
+    } else {
+      location.hash = wizardHash(4, analysisId);
+    }
+  }
+  App.runGenerateFromMap = runGenerateFromMap;
+
+  function showGenerateResultBanner(out) {
+    const old = document.getElementById('generate-result-banner');
+    if (old) old.remove();
+    const gen = out.gen || {};
+    const banner = el('div', {
+      id: 'generate-result-banner',
+      style: 'position:absolute;left:12px;right:12px;bottom:12px;z-index:800;background:#fff;border-radius:12px;box-shadow:0 8px 28px rgba(0,0,0,.22);padding:14px 16px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;',
+    }, [
+      el('div', { style: 'flex:1;min-width:200px;' }, [
+        el('div', { style: 'font-weight:700;font-size:14px;' }, [el('i', { class: 'fa-solid fa-circle-check', style: 'color:#1F7A54;margin-right:6px;' }), 'Draft perencanaan dibuat']),
+        el('div', { class: 'text-xs text-muted' }, [
+          fmtNumber((gen.odps || []).length) + ' ODP · ' + fmtNumber((gen.odcs || []).length) + ' ODC · ' + fmtNumber((gen.poles && gen.poles.points ? gen.poles.points.length : 0)) + ' tiang — hasil sudah tampil di folder "Draft Perencanaan" di kanan, silakan geser/edit/hapus dulu di peta sebelum disimpan.',
+        ]),
+      ]),
+      el('button', { class: 'btn btn-ghost btn-sm', onclick: () => banner.remove() }, ['Tutup']),
+      el('button', { class: 'btn btn-primary btn-sm', onclick: () => { location.hash = '#/planning-summary?analysis=' + out.analysisId; } }, [el('i', { class: 'fa-solid fa-floppy-disk' }), ' Simpan & Lihat Detail Analisa']),
     ]);
     ($('#map-container') || document.body).appendChild(banner);
   }
@@ -3070,6 +3402,99 @@
       setTimeout(() => { try { map.invalidateSize(); } catch (e) {} }, 200);
     }, 60);
 
+    // ---- FIX #E38/#E42: BOQ + detail per item + Export, langsung di Detail Analisa ----
+    // Kalau draft Generate untuk analisa ini masih ada di memori (baru saja
+    // di-generate di sesi ini), tampilkan BOQ-nya + bisa diklik per baris untuk
+    // lihat detail (daftar ODP/ODC/dsb yang menyusun angka itu), plus Export.
+    const G = App._lastGeneration;
+    if (G && G.gen && (!analysisId || G.analysisId === analysisId)) {
+      const snap = genSnapshot(G.gen);
+      const reports = window.PlanningFinal.buildReports({ snapshot: snap });
+
+      // FIX #E42: ambil spek TERBARU (core/tinggi) yang sudah diedit planner di
+      // peta (folder Draft Perencanaan) langsung dari database, supaya BOQ di
+      // sini selalu sinkron — bukan cuma angka dari hasil generate awal.
+      let backboneCore = null, distributionCore = null;
+      const poleHeightGroups = {}; // '6' -> count, '7' -> count, '9' -> count, '' -> belum diisi
+      try {
+        let q1 = App.supabase.from('planning_backbone').select('core_count').limit(1);
+        if (G.savedId) q1 = q1.eq('generation_id', G.savedId);
+        const r1 = await q1; backboneCore = r1.data && r1.data[0] ? r1.data[0].core_count : null;
+      } catch (e) {}
+      try {
+        let q2 = App.supabase.from('planning_distribution').select('core_count').limit(1);
+        if (G.savedId) q2 = q2.eq('generation_id', G.savedId);
+        const r2 = await q2; distributionCore = r2.data && r2.data[0] ? r2.data[0].core_count : null;
+      } catch (e) {}
+      try {
+        let q3 = App.supabase.from('planning_poles').select('height_m');
+        if (G.savedId) q3 = q3.eq('generation_id', G.savedId);
+        const r3 = await q3;
+        (r3.data || []).forEach((row) => { const k = row.height_m ? String(row.height_m) : ''; poleHeightGroups[k] = (poleHeightGroups[k] || 0) + 1; });
+      } catch (e) {}
+
+      const boqCard = el('div', { class: 'card', style: 'margin-top:16px;' }, [
+        el('div', { class: 'card-header' }, [
+          el('h3', {}, ['BOQ (Bill of Quantity) — Draft Perencanaan']),
+          el('div', { style: 'display:flex;gap:6px;' }, [
+            el('button', { class: 'btn btn-secondary btn-sm', onclick: () => {
+              const exportObj = { title: reports.boq.title, columns: ['Item', 'Satuan', 'Qty', 'Keterangan'], rows: boqRows.map((r) => [r.item, r.unit || '-', r.qty, r.note]) };
+              window.PlanningFinal.downloadBlob('boq_' + (analysisId || 'draft') + '.csv', 'text/csv', window.PlanningFinal.reportToCSV(exportObj));
+            } }, [el('i', { class: 'fa-solid fa-file-csv' }), ' Export CSV']),
+            el('button', { class: 'btn btn-secondary btn-sm', onclick: () => { location.hash = '#/export'; } }, [el('i', { class: 'fa-solid fa-file-export' }), ' Export Lainnya']),
+          ]),
+        ]),
+        el('p', { class: 'text-xs text-muted' }, ['Klik baris untuk lihat rincian (mis. daftar ODP/ODC per titik). Kolom "Keterangan" mengikuti spek (core/tinggi) yang dipilih planner di peta. Harga satuan belum tersedia — ini kuantitas saja.']),
+      ]);
+      const boqDetailBox = el('div', { id: 'boq-detail-box', style: 'margin-top:10px;' });
+      const boqTable = el('table', { class: 'data-table' });
+      boqTable.appendChild(el('thead', {}, [el('tr', {}, ['Item', 'Satuan', 'Qty', 'Keterangan'].map((h) => el('th', {}, [h])))]));
+      const boqRows = [];
+      (reports.boq.rows || []).forEach((row) => {
+        const [item, unit, qty] = row;
+        const lower = item.toLowerCase();
+        if (lower.includes('tiang') || lower.includes('pole')) {
+          // FIX #E42: pecah jadi per tinggi, bukan 1 angka gabungan.
+          const groupKeys = Object.keys(poleHeightGroups);
+          if (groupKeys.length) {
+            groupKeys.sort().forEach((h) => {
+              boqRows.push({ item: 'Tiang', unit: unit || 'unit', qty: poleHeightGroups[h], note: h ? (h + ' m') : 'Tinggi belum diisi', key: null });
+            });
+          } else {
+            boqRows.push({ item, unit, qty, note: 'Tinggi belum diisi (edit di peta)', key: null });
+          }
+          return;
+        }
+        const key = lower.includes('odp') ? 'odp' : lower.includes('odc') ? 'odc' : lower.includes('backbone') ? 'backbone' : lower.includes('distribution') ? 'distribution' : lower.includes('bangunan') || lower.includes('home') ? 'building' : null;
+        const note = key === 'backbone' ? (backboneCore ? backboneCore + ' core' : 'Core belum dipilih (edit di peta)')
+          : key === 'distribution' ? (distributionCore ? distributionCore + ' core' : 'Core belum dipilih (edit di peta)')
+          : '-';
+        boqRows.push({ item, unit, qty, note, key });
+      });
+      const boqBody = el('tbody', {}, boqRows.map((r) => el('tr', {
+        style: r.key ? 'cursor:pointer;' : '',
+        title: r.key ? 'Klik untuk lihat detail' : '',
+        onclick: r.key ? () => renderBoqDetail(r.key, reports) : null,
+      }, [el('td', {}, [r.item + (r.key ? ' 🔍' : '')]), el('td', {}, [r.unit || '-']), el('td', {}, [fmtNumber(r.qty)]), el('td', { class: 'text-xs' }, [r.note])])));
+      boqTable.appendChild(boqBody);
+      boqCard.appendChild(boqTable);
+      boqCard.appendChild(boqDetailBox);
+      container.appendChild(boqCard);
+
+      function renderBoqDetail(key, reportsObj) {
+        const r = reportsObj[key];
+        boqDetailBox.innerHTML = '';
+        if (!r || !r.rows || !r.rows.length) { boqDetailBox.appendChild(el('p', { class: 'text-muted' }, ['Tidak ada detail untuk item ini.'])); return; }
+        const dTable = el('table', { class: 'data-table' });
+        dTable.appendChild(el('thead', {}, [el('tr', {}, r.columns.map((h) => el('th', {}, [h])))]));
+        dTable.appendChild(el('tbody', {}, r.rows.slice(0, 200).map((row) => el('tr', {}, row.map((c) => el('td', {}, [String(c)]))))));
+        boqDetailBox.appendChild(el('div', { class: 'card', style: 'background:var(--color-bg);' }, [
+          el('div', { class: 'card-header' }, [el('h3', { style: 'font-size:14px;' }, [r.title]), el('button', { class: 'icon-btn', onclick: () => { boqDetailBox.innerHTML = ''; } }, [el('i', { class: 'fa-solid fa-xmark' })])]),
+          el('div', { class: 'table-wrap' }, [dTable]),
+        ]));
+      }
+    }
+
     container.appendChild(el('p', { class: 'text-xs text-muted', style: 'margin-top:12px;' }, [
       'Coverage % pada tahap analisa = homepass ratio (rumah ÷ total bangunan). Coverage berbasis ' +
       'radius layanan ODP dihitung pada tahap generate (fase berikutnya). Provider bangunan/jalan ' +
@@ -3225,7 +3650,7 @@
       body.appendChild(el('div', { class: 'card' }, [
         el('div', { class: 'card-header' }, [el('h3', {}, ['Step 1 — Import / Gambar Boundary'])]),
         el('p', { class: 'text-muted' }, ['Import KMZ/KML/GeoJSON/SHP atau gambar polygon LANGSUNG di peta bawah ini — boundary inilah dasar seluruh perencanaan. Tidak perlu buka menu Mapping.']),
-        el('p', {}, [n ? el('span', { class: 'badge badge-success' }, [n + ' polygon terdeteksi di peta']) : el('span', { class: 'badge badge-warning' }, ['Belum ada polygon di peta'])]),
+        el('p', {}, [n ? el('span', { class: 'badge badge-success' }, [n + ' polygon/boundary terdeteksi di peta']) : el('span', { class: 'badge badge-warning' }, ['Belum ada polygon/garis tertutup di peta'])]),
         el('div', { style: 'display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap;' }, [
           el('button', { class: 'btn btn-secondary btn-sm', onclick: () => openImportDialog() }, [el('i', { class: 'fa-solid fa-file-import' }), ' Import Data']),
           el('button', { class: 'btn btn-secondary btn-sm', onclick: () => drawPolygonOnCurrentMap(() => { toast('Polygon tergambar.', 'success'); location.hash = wizardHash(1, analysisId); }) }, [el('i', { class: 'fa-solid fa-draw-polygon' }), ' Gambar Polygon']),

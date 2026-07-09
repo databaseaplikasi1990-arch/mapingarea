@@ -176,7 +176,7 @@
         title: 'Tiang', table: 'poles', geometryType: 'point',
         fields: [
           { key: 'code', label: 'Kode Tiang', type: 'text', required: true },
-          { key: 'height_m', label: 'Tinggi (m)', type: 'number' },
+          { key: 'height_m', label: 'Tinggi (m)', type: 'select', options: [6, 7, 9], numeric: true },
           { key: 'material', label: 'Material', type: 'select', options: ['Besi', 'Beton', 'Kayu'] },
           { key: 'condition', label: 'Kondisi', type: 'select', options: ['Baik', 'Rusak Ringan', 'Rusak Berat'] },
           { key: 'lat', label: 'Latitude', type: 'number', required: true },
@@ -191,7 +191,7 @@
           { key: 'pop_id', label: 'POP', type: 'relation', relationTable: 'pops', relationLabel: 'name' },
           { key: 'odc_id', label: 'ODC', type: 'relation', relationTable: 'odc', relationLabel: 'name' },
           { key: 'length_m', label: 'Panjang (m)', type: 'number' },
-          { key: 'core_count', label: 'Jumlah Core', type: 'number' },
+          { key: 'core_count', label: 'Jumlah Core', type: 'select', options: [96, 48, 24], numeric: true },
         ],
       },
       distributions: {
@@ -202,7 +202,7 @@
           { key: 'odc_id', label: 'ODC', type: 'relation', relationTable: 'odc', relationLabel: 'name' },
           { key: 'odp_id', label: 'ODP', type: 'relation', relationTable: 'odp', relationLabel: 'name' },
           { key: 'length_m', label: 'Panjang (m)', type: 'number' },
-          { key: 'core_count', label: 'Jumlah Core', type: 'number' },
+          { key: 'core_count', label: 'Jumlah Core', type: 'select', options: [24, 16, 6], numeric: true },
         ],
       },
       kabels: {
